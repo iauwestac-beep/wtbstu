@@ -8,6 +8,13 @@ on:
   push:
     branches: [main]
 
+# وقتی چند فایل را پشت سر هم آپلود می‌کنید، GitHub برای هر فایل یک کامیت
+# جدا می‌سازد و هر کامیت یک بیلد راه می‌اندازد؛ این تنظیم بیلدهای قبلی را
+# لغو می‌کند تا فقط آخرین وضعیت مخزن ساخته شود (و اجرای نیمه‌کاره شکست نخورد).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
