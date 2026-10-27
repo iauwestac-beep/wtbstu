@@ -1,8 +1,8 @@
 // lib/excel_service.dart
 //
 // ورود/خروجی اکسل برای برنامهٔ «ثبت تخلف پوشش»
-// ─ ورود: فایل دانشجویان دانشگاه (۱۸ ستون، با ت Matching نرم سرصفحه‌ها)
-// ─ خروجی: یک شیت واحد «تخلفات» با ستون‌های استاندارد دانشگاه
+// ─ ورود: فایل دانشجویان دانشگاه (نگاشت نرم سرصفحه‌ها)
+// ─ خروجی: یک شیت «تخلفات» با همان ستون‌های فایل ورودی + ستون‌های تخلف
 import 'dart:io';
 
 import 'package:excel/excel.dart';
@@ -83,8 +83,7 @@ class Student {
 
   String get key => '$studentNo|$major';
   String get fullName => ('$firstName $lastName').trim();
-  String get initial =>
-      firstName.isNotEmpty ? firstName.substring(0, 1) : '؟';
+  String get initial => firstName.isNotEmpty ? firstName.substring(0, 1) : '؟';
 }
 
 class ViolationRow {
@@ -103,6 +102,52 @@ class ViolationRow {
   });
 }
 
+/// یک ستون فایل دانشگاه (سرصفحهٔ اصلی + کلید استاندارد)
+class ImportCol {
+  final String header;
+  final String key;
+  const ImportCol(this.header, this.key);
+
+  Map<String, dynamic> toJson() => {'h': header, 'k': key};
+
+  static ImportCol? fromJson(dynamic m) {
+    if (m is! Map) return null;
+    final h = '${m['h'] ?? ''}';
+    final k = '${m['k'] ?? ''}';
+    if (h.isEmpty || k.isEmpty) return null;
+    return ImportCol(h, k);
+  }
+}
+
+/// اگر فایلی آپلود نشده باشد (یا نسخهٔ قدیمی)، خروجی با این ستون‌ها ساخته می‌شود
+const List<ImportCol> kDefaultColumns = [
+  ImportCol('نام دانشکده', F.college),
+  ImportCol('نام شخص', F.firstName),
+  ImportCol('نام خانوادگي', F.lastName),
+  ImportCol('نام پدر', F.fatherName),
+  ImportCol('شماره شناسنامه', F.birthCertNo),
+  ImportCol('كد ملي', F.nationalId),
+  ImportCol('تاريخ تولد', F.birthDate),
+  ImportCol('شماره دانشجویی', F.studentNo),
+  ImportCol('کد تقويم', F.calendarCode),
+  ImportCol('نام رشته خام', F.major),
+  ImportCol('نام مقطع', F.level),
+  ImportCol('نوع پذيرش', F.admissionType),
+  ImportCol('فعال بودن', F.active),
+  ImportCol('تعداد واحد اخذ شده نيمسال', F.semesterCredits),
+  ImportCol('نام وضعيت', F.statusName),
+  ImportCol('شماره موبایل', F.mobile),
+  ImportCol('نیمسال ورود', F.entryTerm),
+];
+
+/// ستون‌هایی که برنامه به انتهای فایل اضافه می‌کند
+const List<String> _violationHeaders = [
+  'تاريخ و ساعت تخلف',
+  'موارد تخلف',
+  'توضيحات',
+  'ثبت كننده',
+];
+
 class ImportResult {
   final List<Student> toImport;
   final File reportFile;
@@ -110,12 +155,16 @@ class ImportResult {
   final int duplicateRows;
   final List<List<String>> duplicates;
 
+  /// ستون‌های فایل ورودی، به همان ترتیب (برای ساخت خروجی هم‌شکل)
+  final List<ImportCol> columns;
+
   const ImportResult({
     required this.toImport,
     required this.reportFile,
     required this.totalRows,
     required this.duplicateRows,
     required this.duplicates,
+    required this.columns,
   });
 }
 
@@ -145,7 +194,6 @@ String normKey(String s) {
       .replaceAll(')', ' ');
   t = t.replaceAll(RegExp(r'[\u064B-\u0652\u200e\u200f]'), '');
   t = t.replaceAll(RegExp(r'[0-9]'), ' ');
-  t = t.replaceAll('  ', ' ');
   return t.replaceAll(RegExp(r'\s+'), ' ').trim();
 }
 
@@ -207,6 +255,53 @@ const Map<String, String> _aliases = {
   'شماره موبایل': F.mobile,
   'موبایل': F.mobile,
   'نیمسال ورود': F.entryTerm,
+};
+
+/// نام نمایشی هر کلید (برای سرصفحهٔ خروجی؛ مستقل از آشفتگی فایل مبدأ)
+const Map<String, String> _display = {
+  F.college: 'نام دانشکده',
+  F.firstName: 'نام شخص',
+  F.lastName: 'نام خانوادگي',
+  F.fatherName: 'نام پدر',
+  F.birthCertNo: 'شماره شناسنامه',
+  F.nationalId: 'كد ملي',
+  F.birthDate: 'تاريخ تولد',
+  F.birthPlace: 'محل تولد',
+  F.issuePlace: 'محل صدور',
+  F.studentNo: 'شماره دانشجویی',
+  F.calendarCode: 'کد تقويم',
+  F.calendarName: 'نام تقويم',
+  F.major: 'نام رشته خام',
+  F.gender: 'جنسيت',
+  F.level: 'نام مقطع',
+  F.systemName: 'نام نظام',
+  F.admissionType: 'نوع پذيرش',
+  F.faLangCertificate: 'مدرک زبان فارسي',
+  F.faLangCertificateOk: 'تاييديه مدرک زبان فارسي',
+  F.startDate: 'تاريخ شروع',
+  F.startDateCal: 'تاريخ شروع تقويم',
+  F.endDate: 'تاريخ پايان',
+  F.studyStatus: 'وضعيت تحصيلي',
+  F.active: 'فعال بودن',
+  F.semesterCredits: 'تعداد واحد اخذ شده نيمسال',
+  F.termsLeft: 'تعداد ترم هاي باقيمانده',
+  F.termsPassed: 'تعداد ترم هاي گذرانده شده',
+  F.statusCode: 'کد وضعيت',
+  F.statusName: 'نام وضعيت',
+  F.statusName2: 'نام وضعيت "_1',
+  F.studyStart: 'تاريخ شروع تحصيل',
+  F.studyStart2: 'تاريخ شروع تحصيل (۲)',
+  F.studyEnd: 'تاريخ پايان تحصيل',
+  F.studyEnd2: 'تاريخ پايان تحصيل (۲)',
+  F.daysPassed: 'تعداد روزهاي گذشته',
+  F.personId: 'شناسه شخص',
+  F.graduationDate: 'تاريخ فارغ التحصيلي',
+  F.erstDate: 'تاريخ ERST',
+  F.yearsExtension: 'تمديد سنوات',
+  F.archiveNo: 'شماره بايگاني',
+  F.extensionDate: 'تاريخ تمديد',
+  F.mobile: 'شماره موبایل',
+  F.entryTerm: 'نیمسال ورود',
 };
 
 /// ترتیب جست‌وجوی پیشوندی (بلندترین‌ها اول، تا «تاریخ شروع تحصیل» جلوتر از «تاریخ شروع» بیاید)
@@ -289,82 +384,31 @@ String _jStamp() {
   return '${j.year}${p(j.month)}${p(j.day)}';
 }
 
-/// ───────── ستون‌های شیت خروجی ─────────
-class _Col {
-  final String header;
-  final String? core; // first | last | no | nid | major
-  final String? key; // کلید در Student.extra
-  const _Col(this.header, {this.core, this.key});
-}
-
-const List<_Col> _exportColumns = [
-  _Col('نام شخص', core: 'first'),
-  _Col('نام خانوادگي', core: 'last'),
-  _Col('نام پدر', key: F.fatherName),
-  _Col('شماره شناسنامه', key: F.birthCertNo),
-  _Col('كد ملي', core: 'nid'),
-  _Col('محل تولد', key: F.birthPlace),
-  _Col('محل صدور', key: F.issuePlace),
-  _Col('تاريخ تولد', key: F.birthDate),
-  _Col('شماره دانشجویی', core: 'no'),
-  _Col('کد تقويم', key: F.calendarCode),
-  _Col('نام تقويم', key: F.calendarName),
-  _Col('خالی'),
-  _Col('نام رشته خام', core: 'major'),
-  _Col('جنسيت', key: F.gender),
-  _Col('نام مقطع', key: F.level),
-  _Col('نام نظام', key: F.systemName),
-  _Col('نوع پذيرش', key: F.admissionType),
-  _Col('مدرک زبان فارسي', key: F.faLangCertificate),
-  _Col('تاييديه مدرک زبان فارسي', key: F.faLangCertificateOk),
-  _Col('تاريخ شروع', key: F.startDate),
-  _Col('تاريخ شروع تقويم', key: F.startDateCal),
-  _Col('تاريخ پايان', key: F.endDate),
-  _Col('وضعيت تحصيلي', key: F.studyStatus),
-  _Col('فعال بودن', key: F.active),
-  _Col('تعداد واحد اخذ شده نيمسال', key: F.semesterCredits),
-  _Col('تعداد ترم هاي باقيمانده', key: F.termsLeft),
-  _Col('تعداد ترم هاي گذرانده شده', key: F.termsPassed),
-  _Col('کد وضعيت', key: F.statusCode),
-  _Col('نام وضعيت', key: F.statusName),
-  _Col('نام وضعيت "_1', key: F.statusName2),
-  _Col('تاريخ شروع تحصيل', key: F.studyStart),
-  _Col('تاريخ شروع تحصيل ', key: F.studyStart2),
-  _Col('تاريخ پايان تحصيل', key: F.studyEnd),
-  _Col('تاريخ پايان تحصيل ', key: F.studyEnd2),
-  _Col('تعداد روزهاي گذشته', key: F.daysPassed),
-  _Col('شناسه شخص', key: F.personId),
-  _Col('تاريخ فارغ التحصيلي', key: F.graduationDate),
-  _Col('تاريخ ERST', key: F.erstDate),
-  _Col('تمديد سنوات', key: F.yearsExtension),
-  _Col('شماره بايگاني', key: F.archiveNo),
-  _Col('تاريخ تمديد', key: F.extensionDate),
-  _Col('شماره موبایل', key: F.mobile),
-];
-
-const List<String> _violationHeaders = [
-  'تاريخ و ساعت تخلف',
-  'موارد تخلف',
-  'توضيحات',
-  'ثبت كننده',
-];
-
-String _valueOf(Student s, _Col c) {
-  switch (c.core) {
-    case 'first':
-      return s.firstName;
-    case 'last':
-      return s.lastName;
-    case 'no':
+/// مقدار یک ستون برای یک دانشجو (اول از extras، بعد از فیلدهای پایه)
+String valueFor(Student s, String key) {
+  final v = s.extra[key];
+  if (v != null && v.isNotEmpty) return v;
+  switch (key) {
+    case F.studentNo:
       return s.studentNo;
-    case 'nid':
+    case F.nationalId:
       return s.nationalId;
-    case 'major':
+    case F.firstName:
+      return s.firstName;
+    case F.lastName:
+      return s.lastName;
+    case F.major:
       return s.major;
   }
-  final k = c.key;
-  if (k == null) return '';
-  return (s.extra[k] ?? '').trim();
+  return '';
+}
+
+/// ───────── نگاشت یک ردیف سرصفحه ─────────
+class _Mapped {
+  final int index;
+  final String header;
+  final String key;
+  const _Mapped(this.index, this.header, this.key);
 }
 
 /// ───────── سرویس اکسل ─────────
@@ -376,19 +420,19 @@ class ExcelService {
     // بهترین (شیت، ردیف سرصفحه) را پیدا می‌کند؛ تحمل ردیف عنوان بالای جدول
     Sheet? sheet;
     var headerRow = 0;
-    Map<int, String> bestMap = {};
+    var bestCols = <_Mapped>[];
     for (final candidate in excel.tables.values) {
       final limit = candidate.rows.length < 8 ? candidate.rows.length : 8;
       for (var r = 0; r < limit; r++) {
-        final map = _mapHeaders(candidate.rows[r]);
-        if (map.length > bestMap.length) {
-          bestMap = map;
+        final cols = _mapHeaders(candidate.rows[r]);
+        if (cols.length > bestCols.length) {
+          bestCols = cols;
           sheet = candidate;
           headerRow = r;
         }
       }
     }
-    if (sheet == null || bestMap.length < 2) {
+    if (sheet == null || bestCols.length < 2) {
       // پیام خطا شامل سرصفحه‌های واقعی فایل است تا عیب‌یابی ساده باشد
       final sample = excel.tables.values
           .where((s) => s.rows.isNotEmpty)
@@ -397,7 +441,9 @@ class ExcelService {
       throw Exception('سرصفحه‌های فایل شناخته نشد. ردیف اول: $sample');
     }
     final colOf = <String, int>{}; // key → column index
-    bestMap.forEach((index, key) => colOf.putIfAbsent(key, () => index));
+    for (final c in bestCols) {
+      colOf.putIfAbsent(c.key, () => c.index);
+    }
     if (!colOf.containsKey(F.studentNo)) {
       final sample = sheet.rows[headerRow].take(12).map(_text).join(' | ');
       throw Exception('ستون «شماره دانشجویی» پیدا نشد. سرصفحه‌ها: $sample');
@@ -453,11 +499,12 @@ class ExcelService {
       totalRows: all.length,
       duplicateRows: dupRows.length,
       duplicates: dupRows,
+      columns: bestCols.map((c) => ImportCol(c.header, c.key)).toList(),
     );
   }
 
-  Map<int, String> _mapHeaders(List<Data?> headerRow) {
-    final map = <int, String>{};
+  List<_Mapped> _mapHeaders(List<Data?> headerRow) {
+    final list = <_Mapped>[];
     final used = <String>{};
     for (var i = 0; i < headerRow.length; i++) {
       final raw = _text(headerRow[i]);
@@ -471,9 +518,9 @@ class ExcelService {
         key = alt;
       }
       used.add(key);
-      map[i] = key;
+      list.add(_Mapped(i, _display[key] ?? raw, key));
     }
-    return map;
+    return list;
   }
 
   String? _duplicateKeyOf(String key) {
@@ -493,20 +540,25 @@ class ExcelService {
     return row[index];
   }
 
-  /// ۲) خروجی تخلفات در یک شیت
-  Future<File> exportViolations(List<ViolationRow> rows) async {
+  /// ۲) خروجی تخلفات در یک شیت، هم‌شکل فایل ورودی + ستون‌های تخلف
+  Future<File> exportViolations(
+    List<ViolationRow> rows, {
+    List<ImportCol> columns = const [],
+  }) async {
+    final cols = columns.isEmpty ? kDefaultColumns : columns;
+
     final ex = Excel.createExcel();
     final sheet = ex['تخلفات'];
     sheet.isRTL = true;
 
     sheet.appendRow([
-      ..._exportColumns.map((c) => TextCellValue(c.header)),
+      ...cols.map((c) => TextCellValue(c.header)),
       ..._violationHeaders.map((h) => TextCellValue(h)),
     ]);
 
     for (final v in rows) {
       sheet.appendRow([
-        ..._exportColumns.map((c) => TextCellValue(_valueOf(v.student, c))),
+        ...cols.map((c) => TextCellValue(valueFor(v.student, c.key))),
         TextCellValue(jalali(v.occurredAt)),
         TextCellValue(v.checkedItems.join(' ، ')),
         TextCellValue(v.note),
@@ -518,7 +570,8 @@ class ExcelService {
     return _save(ex, 'گزارش_تخلفات');
   }
 
-  Future<File> _writeReport(List<Student> imported, List<List<String>> dups) async {
+  Future<File> _writeReport(
+      List<Student> imported, List<List<String>> dups) async {
     final ex = Excel.createExcel();
     final sheet = ex['گزارش آپلود'];
     sheet.isRTL = true;
