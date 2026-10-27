@@ -49,7 +49,7 @@ Map<String, String> _decodeExtras(Object? raw) {
 /// ───────── دیتابیس محلی (رمزنگاری‌شده) ─────────
 class LocalDb {
   static Database? _db;
-  static const _version = 2;
+  static const _version = 3;
 
   static Future<Database> open(String key) async {
     if (_db != null) return _db!;
@@ -81,9 +81,10 @@ class LocalDb {
             recorded_by TEXT,
             synced INTEGER DEFAULT 0)''');
         await d.execute('CREATE INDEX idx_v_student ON violations(student_key)');
+        await d.execute('CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)');
       },
       onUpgrade: (d, oldVersion, newVersion) async {
-        // نسخه ۱ → ۲ : افزودن ستون‌های دانشگاه
+        // افزودن ستون‌های دانشگاه (نسخهٔ ۱ → ۲)
         final existing = (await d.rawQuery('PRAGMA table_info(students)'))
             .map((r) => '${r['name']}')
             .toSet();
@@ -94,6 +95,9 @@ class LocalDb {
           await d.execute(
               'ALTER TABLE students ADD COLUMN source_row INTEGER DEFAULT 0');
         }
+        // نگهداری ترتیب ستون‌های فایل ورودی (نسخهٔ ۲ → ۳)
+        await d.execute(
+            'CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)');
       },
     );
     return _db!;
@@ -123,6 +127,27 @@ class LocalDb {
       );
     }
     await b.commit(noResult: true);
+  }
+
+  /// ذخیرهٔ ترتیب ستون‌های فایل ورودی (تا خروجی هم‌شکل همان فایل باشد)
+  static Future<void> saveColumns(List<ImportCol> cols) async {
+    await _d.insert(
+      'meta',
+      {'k': 'columns', 'v': jsonEncode(cols.map((c) => c.toJson()).toList())},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// ستون‌های ذخیره‌شده؛ اگر نبود، فهرست خالی (و خروجی با ستون‌های پیش‌فرض ساخته می‌شود)
+  static Future<List<ImportCol>> loadColumns() async {
+    final rows = await _d.query('meta', where: 'k=?', whereArgs: ['columns']);
+    if (rows.isEmpty) return const [];
+    try {
+      final list = jsonDecode('${rows.first['v']}') as List;
+      return list.map(ImportCol.fromJson).whereType<ImportCol>().toList();
+    } catch (_) {
+      return const [];
+    }
   }
 
   static Student _student(Map<String, Object?> r) => Student(
@@ -293,7 +318,8 @@ class _SearchScreenState extends State<SearchScreen> {
         _snack('هنوز تخلفی ثبت نشده است');
         return;
       }
-      final file = await ExcelService().exportViolations(rows);
+      final file = await ExcelService()
+          .exportViolations(rows, columns: await LocalDb.loadColumns());
       await ExcelService().share(file);
     } catch (e) {
       _snack('خطا: $e');
