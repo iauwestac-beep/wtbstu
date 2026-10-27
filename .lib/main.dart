@@ -173,6 +173,8 @@ class _StandaloneHomeState extends State<StandaloneHome> {
       final svc = ExcelService();
       final res = await svc.importStudents(path);
       await LocalDb.upsertStudents(res.toImport);
+      // ترتیب ستون‌های همین فایل ذخیره می‌شود تا خروجی هم‌شکل فایل ورودی باشد
+      await LocalDb.saveColumns(res.columns);
       setState(() => _msg = 'کل ردیف‌ها: ${res.totalRows}\n'
           'دانشجوی وارد‌شده: ${res.toImport.length}\n'
           'ردیف تکراری: ${res.duplicateRows}');
@@ -187,7 +189,8 @@ class _StandaloneHomeState extends State<StandaloneHome> {
           return;
         }
         final svc = ExcelService();
-        await svc.share(await svc.exportViolations(rows));
+        final cols = await LocalDb.loadColumns();
+        await svc.share(await svc.exportViolations(rows, columns: cols));
         setState(() => _msg = 'خروجی اکسل آماده شد (${rows.length} ردیف)');
       });
 
