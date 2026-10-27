@@ -27,22 +27,30 @@ jobs:
           channel: stable
           cache: true
 
-      # اگر فایل‌ها داخل lib باشند همان‌ها استفاده می‌شوند؛ در غیر این صورت
-      # فایل‌های ریشهٔ مخزن (رفتار قبلی) کپی می‌شوند.
+      # پوشهٔ کد می‌تواند lib یا .lib باشد (اگر هنگام ساخت پوشه اشتباهی نقطه
+      # اول نام اضافه شود، پوشه مخفی می‌شود). هر دو پشتیبانی می‌شوند.
       - name: Create Android project and copy code
         run: |
           flutter create --platforms android --org ir.dresscode --project-name dress_app app_tmp
           rm -rf app_tmp/lib app_tmp/test
           mkdir -p app_tmp/lib
-          cp lib/*.dart app_tmp/lib/ 2>/dev/null || true
-          if [ ! -f app_tmp/lib/main.dart ]; then
-            echo "lib/main.dart پیدا نشد؛ استفاده از فایل‌های ریشهٔ مخزن"
-            cp *.dart app_tmp/lib/ 2>/dev/null || true
-            if [ -f app_tmp/lib/main_standalone.dart ]; then
-              mv app_tmp/lib/main_standalone.dart app_tmp/lib/main.dart
+          copied=0
+          for d in lib .lib; do
+            if ls "$d"/*.dart >/dev/null 2>&1; then
+              cp "$d"/*.dart app_tmp/lib/ && copied=1
+              echo "کد از پوشهٔ $d کپی شد"
             fi
+          done
+          if [ "$copied" -eq 0 ]; then
+            echo "پوشهٔ lib/.lib پیدا نشد؛ استفاده از فایل‌های ریشهٔ مخزن"
+            cp *.dart app_tmp/lib/ 2>/dev/null || true
+          fi
+          if [ ! -f app_tmp/lib/main.dart ] && [ -f app_tmp/lib/main_standalone.dart ]; then
+            mv app_tmp/lib/main_standalone.dart app_tmp/lib/main.dart
           fi
           ls app_tmp/lib
+          [ -f app_tmp/lib/main.dart ] \
+            || { echo '::error::main.dart پیدا نشد؛ فایل‌ها را داخل پوشهٔ lib بگذارید'; exit 1; }
 
       # ── تغییر اصلی ──
       # file_picker 8.x مقدار compileSdk را در ماژول اندرویدش روی 34 هاردکد کرده بود،
