@@ -12,6 +12,13 @@ import 'package:shamsi_date/shamsi_date.dart';
 
 /// ───────── کلیدهای استاندارد ستون‌ها ─────────
 class F {
+  // کلیدهای پایه (ستون‌های اصلی دانشجو)
+  static const studentNo = 'studentNo';
+  static const nationalId = 'nationalId';
+  static const firstName = 'firstName';
+  static const lastName = 'lastName';
+  static const major = 'major';
+
   static const college = 'college';
   static const fatherName = 'fatherName';
   static const birthCertNo = 'birthCertNo';
@@ -366,28 +373,38 @@ class ExcelService {
   Future<ImportResult> importStudents(String path) async {
     final excel = Excel.decodeBytes(await File(path).readAsBytes());
 
-    // شیتی که بهترین تطابق سرصفحه را دارد انتخاب می‌شود
+    // بهترین (شیت، ردیف سرصفحه) را پیدا می‌کند؛ تحمل ردیف عنوان بالای جدول
     Sheet? sheet;
+    var headerRow = 0;
     Map<int, String> bestMap = {};
     for (final candidate in excel.tables.values) {
-      if (candidate.rows.isEmpty) continue;
-      final map = _mapHeaders(candidate.rows.first);
-      if (map.length > bestMap.length) {
-        bestMap = map;
-        sheet = candidate;
+      final limit = candidate.rows.length < 8 ? candidate.rows.length : 8;
+      for (var r = 0; r < limit; r++) {
+        final map = _mapHeaders(candidate.rows[r]);
+        if (map.length > bestMap.length) {
+          bestMap = map;
+          sheet = candidate;
+          headerRow = r;
+        }
       }
     }
-    if (sheet == null || bestMap.isEmpty) {
-      throw Exception('هیچ شیتی با سرصفحه‌های شناخته‌شده پیدا نشد');
+    if (sheet == null || bestMap.length < 2) {
+      // پیام خطا شامل سرصفحه‌های واقعی فایل است تا عیب‌یابی ساده باشد
+      final sample = excel.tables.values
+          .where((s) => s.rows.isNotEmpty)
+          .map((s) => s.rows.first.take(12).map(_text).join(' | '))
+          .join('  ||  ');
+      throw Exception('سرصفحه‌های فایل شناخته نشد. ردیف اول: $sample');
     }
     final colOf = <String, int>{}; // key → column index
     bestMap.forEach((index, key) => colOf.putIfAbsent(key, () => index));
     if (!colOf.containsKey(F.studentNo)) {
-      throw Exception('ستون «شماره دانشجویی» پیدا نشد');
+      final sample = sheet.rows[headerRow].take(12).map(_text).join(' | ');
+      throw Exception('ستون «شماره دانشجویی» پیدا نشد. سرصفحه‌ها: $sample');
     }
 
     final all = <Student>[];
-    for (var r = 1; r < sheet.rows.length; r++) {
+    for (var r = headerRow + 1; r < sheet.rows.length; r++) {
       final row = sheet.rows[r];
       final no = fixDigits(_text(_at(row, colOf[F.studentNo])));
       if (no.isEmpty) continue;
