@@ -1,0 +1,119 @@
+# مسیر در مخزن: .github/workflows/build.yml
+# مخزن فقط پوشه lib (سه فایل) + همین فایل را لازم دارد؛
+# پروژه اندروید داخل خود GitHub ساخته می‌شود.
+name: Build APK
+
+on:
+  workflow_dispatch:        # دکمه Run workflow
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # برای انتشار APK در Releases لازم است (توکن پیش‌فرض فقط read است)
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # اگر فایل‌ها داخل lib باشند همان‌ها استفاده می‌شوند؛ در غیر این صورت
+      # فایل‌های ریشهٔ مخزن (رفتار قبلی) کپی می‌شوند.
+      - name: Create Android project and copy code
+        run: |
+          flutter create --platforms android --org ir.dresscode --project-name dress_app app_tmp
+          rm -rf app_tmp/lib app_tmp/test
+          mkdir -p app_tmp/lib
+          cp lib/*.dart app_tmp/lib/ 2>/dev/null || true
+          if [ ! -f app_tmp/lib/main.dart ]; then
+            echo "lib/main.dart پیدا نشد؛ استفاده از فایل‌های ریشهٔ مخزن"
+            cp *.dart app_tmp/lib/ 2>/dev/null || true
+            if [ -f app_tmp/lib/main_standalone.dart ]; then
+              mv app_tmp/lib/main_standalone.dart app_tmp/lib/main.dart
+            fi
+          fi
+          ls app_tmp/lib
+
+      # ── تغییر اصلی ──
+      # file_picker 8.x مقدار compileSdk را در ماژول اندرویدش روی 34 هاردکد کرده بود،
+      # ولی flutter_plugin_android_lifecycle (که خودِ همین پلاگین به آن وابسته است)
+      # با SDK 36 ساخته شده و در AAR خودش «compileSdk >= 36» را الزام می‌کند.
+      # نتیجه: شکست در task :file_picker:checkReleaseAarMetadata.
+      # از نسخه 10.3.3 به بعد، file_picker مقدار compileSdk را از
+      # flutter.compileSdkVersion می‌خواند و مشکل رفع شده است.
+      #
+      # عمداً روی شاخه 10.x قفل شده‌ایم چون کد فعلی از
+      # FilePicker.platform.pickFiles() و FilePickerResult استفاده می‌کند:
+      #   • 11.0.0 → متدها static شدند (FilePicker.pickFiles)
+      #   • 12.0.0 → کلاس FilePickerResult حذف شد و pickFiles لیست برمی‌گرداند
+      # پس ارتقا به 13.x یعنی تغییر کد Dart؛ با 10.3.x کد دست‌نخورده می‌ماند.
+      #
+      # توجه: 10.3.11 توسط نگه‌دارنده retract شده و پاب آن را resolve نمی‌کند
+      # (خطای «doesn't match any versions»). پس کف را 10.3.7 می‌گذاریم تا پاب
+      # خودش بالاترین نسخه معتبر 10.x یعنی 10.3.10 را انتخاب کند.
+      - name: Add packages
+        working-directory: app_tmp
+        run: |
+          flutter pub add excel:^4.0.6 path_provider:^2.1.4 share_plus:^10.0.0 \
+            shamsi_date:^1.1.1 sqflite_sqlcipher:^3.1.0 path:^1.9.0 uuid:^4.5.0 \
+            flutter_secure_storage:^9.2.2 shared_preferences:^2.3.2 file_picker:^10.3.7
+          flutter pub add flutter_localizations --sdk=flutter
+          # ثبت نسخه واقعی در لاگ، برای عیب‌یابی دفعات بعد
+          flutter pub deps --style=compact | grep -w file_picker || true
+
+      # sed با || true اگر الگو را پیدا نکند بی‌صدا رد می‌شود و minSdk روی
+      # مقدار پیش‌فرض Flutter می‌ماند (بعداً با sqflite_sqlcipher دردسر می‌شود).
+      # پس اینجا نتیجه بررسی و در صورت شکست، جاب متوقف می‌شود.
+      - name: Set minSdk 24
+        working-directory: app_tmp
+        run: |
+          if [ -f android/app/build.gradle.kts ]; then
+            f=android/app/build.gradle.kts
+            sed -i -E 's/minSdk = (flutter\.minSdkVersion|[0-9]+)/minSdk = 24/' "$f"
+          else
+            f=android/app/build.gradle
+            sed -i -E 's/minSdkVersion (flutter\.minSdkVersion|[0-9]+)/minSdkVersion 24/' "$f"
+          fi
+          grep -qE 'minSdk(Version)?[ =]+24' "$f" \
+            || { echo "::error::minSdk patch did not apply to $f"; exit 1; }
+
+      - name: Set app label
+        working-directory: app_tmp
+        run: |
+          sed -i 's/android:label="[^"]*"/android:label="ثبت تخلف پوشش"/' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:label="ثبت تخلف پوشش"' android/app/src/main/AndroidManifest.xml \
+            || { echo '::error::label patch did not apply'; exit 1; }
+
+      # split-per-abi: به‌جای یک APK ۷۰ مگابایتی (هر سه معماری)، سه APK سبک‌تر
+      # می‌سازد. روی گوشی‌های امروزی فقط app-arm64-v8a-release.apk لازم است.
+      - name: Build release APK
+        working-directory: app_tmp
+        run: flutter build apk --release --split-per-abi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dress-app-apk
+          path: app_tmp/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+
+      # Artifacts فقط از داخل صفحهٔ Actions و با حساب وارد‌شده قابل دانلودند
+      # (روی موبایل هم دکمه‌اش اغلب دیده نمی‌شود). این استپ همان APKها را به
+      # Releases منتشر می‌کند تا لینک ثابت و مستقیم داشته باشید:
+      #   .../releases/latest/download/app-arm64-v8a-release.apk
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: APK build ${{ github.run_number }}
+          files: app_tmp/build/app/outputs/flutter-apk/*.apk
+          generate_release_notes: false
