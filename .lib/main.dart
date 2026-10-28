@@ -1,5 +1,3 @@
-dart
-
 // lib/main.dart
 //
 // نسخهٔ بدون سرور — «ثبت تخلف پوشش»
@@ -7,6 +5,7 @@ dart
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -15,8 +14,10 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shamsi_date/shamsi_date.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import 'excel_service.dart';
 import 'violation_module.dart';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final prefs = await SharedPreferences.getInstance();
@@ -30,9 +31,11 @@ Future<void> main() async {
   await LocalDb.open(key);
   runApp(StandaloneApp(prefs: prefs));
 }
+
 class StandaloneApp extends StatelessWidget {
   final SharedPreferences prefs;
   const StandaloneApp({super.key, required this.prefs});
+
   @override
   Widget build(BuildContext context) {
     const seed = Color(0xFF0F766E);
@@ -63,18 +66,23 @@ class StandaloneApp extends StatelessWidget {
     );
   }
 }
+
 class StandaloneHome extends StatefulWidget {
   final SharedPreferences prefs;
   const StandaloneHome({super.key, required this.prefs});
+
   @override
   State<StandaloneHome> createState() => _StandaloneHomeState();
 }
+
 class _StandaloneHomeState extends State<StandaloneHome> {
   int _students = 0;
   int _violations = 0;
   String _msg = '';
   bool _busy = false;
+
   String get _name => widget.prefs.getString('recorder') ?? '';
+
   @override
   void initState() {
     super.initState();
@@ -83,6 +91,7 @@ class _StandaloneHomeState extends State<StandaloneHome> {
       if (_name.isEmpty) _askName();
     });
   }
+
   Future<void> _refresh() async {
     final s = await LocalDb.studentCount();
     final v = await LocalDb.violationTotal();
@@ -92,6 +101,7 @@ class _StandaloneHomeState extends State<StandaloneHome> {
       _violations = v;
     });
   }
+
   Future<void> _askName() async {
     final c = TextEditingController(text: _name);
     await showDialog<void>(
@@ -123,12 +133,14 @@ class _StandaloneHomeState extends State<StandaloneHome> {
     );
     if (mounted) setState(() {});
   }
+
   void _snack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(msg)));
   }
+
   Future<void> _run(Future<void> Function() job) async {
     if (_busy) return;
     setState(() {
@@ -144,6 +156,7 @@ class _StandaloneHomeState extends State<StandaloneHome> {
       _refresh();
     }
   }
+
   /// آپلود اکسل دانشجوها (سابقهٔ تخلف‌ها حفظ می‌شود)
   Future<void> _importExcel() async {
     final pick = await FilePicker.platform.pickFiles(
@@ -180,10 +193,11 @@ class _StandaloneHomeState extends State<StandaloneHome> {
       await LocalDb.saveColumns(res.columns);
       setState(() => _msg = 'کل ردیف‌ها: ${res.totalRows}\n'
           'دانشجوی وارد‌شده: ${res.toImport.length}\n'
-          'ردیف تکراری: ${res.duplicateRows}');
+          'ردیف تکراری (جایگزین شد): ${res.duplicateRows}');
       if (res.reportFile != null) await svc.share(res.reportFile!);
     });
   }
+
   Future<void> _exportExcel() => _run(() async {
         final rows = await LocalDb.allViolations();
         if (rows.isEmpty) {
@@ -195,6 +209,7 @@ class _StandaloneHomeState extends State<StandaloneHome> {
         await svc.share(await svc.exportViolations(rows, columns: cols));
         setState(() => _msg = 'خروجی اکسل آماده شد (${rows.length} ردیف)');
       });
+
   /// پشتیبان JSON برای جمع‌کردن داده چند گوشی
   Future<void> _exportBackup() => _run(() async {
         final data = jsonEncode(
@@ -209,6 +224,7 @@ class _StandaloneHomeState extends State<StandaloneHome> {
         await Share.shareXFiles([XFile(f.path)]);
         setState(() => _msg = 'فایل پشتیبان ساخته شد');
       });
+
   Future<void> _importBackup() async {
     final pick = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -224,6 +240,7 @@ class _StandaloneHomeState extends State<StandaloneHome> {
           '(موارد تکراری نادیده گرفته شدند)');
     });
   }
+
   Future<void> _openSearch() async {
     if (_students == 0) {
       _snack('ابتدا فایل اکسل دانشجویان را وارد کنید');
@@ -239,6 +256,7 @@ class _StandaloneHomeState extends State<StandaloneHome> {
     );
     _refresh();
   }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -341,18 +359,21 @@ class _StandaloneHomeState extends State<StandaloneHome> {
     );
   }
 }
+
 /// هدر رنگی بالای صفحه + آمار
 class _Header extends StatelessWidget {
   final String name;
   final int students;
   final int violations;
   final VoidCallback onEditName;
+
   const _Header({
     required this.name,
     required this.students,
     required this.violations,
     required this.onEditName,
   });
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -431,11 +452,13 @@ class _Header extends StatelessWidget {
     );
   }
 }
+
 class _Stat extends StatelessWidget {
   final IconData icon;
   final String value;
   final String label;
   const _Stat({required this.icon, required this.value, required this.label});
+
   @override
   Widget build(BuildContext context) => Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
@@ -465,6 +488,7 @@ class _Stat extends StatelessWidget {
         ),
       );
 }
+
 class _ActionTile extends StatelessWidget {
   final IconData icon;
   final String title;
@@ -476,6 +500,7 @@ class _ActionTile extends StatelessWidget {
     required this.subtitle,
     this.onTap,
   });
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -521,11 +546,13 @@ class _ActionTile extends StatelessWidget {
     );
   }
 }
+
 class _MiniTile extends StatelessWidget {
   final IconData icon;
   final String label;
   final VoidCallback? onTap;
   const _MiniTile({required this.icon, required this.label, this.onTap});
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
