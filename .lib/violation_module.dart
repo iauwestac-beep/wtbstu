@@ -1,14 +1,15 @@
-dart
-
 // lib/violation_module.dart
 //
 // دیتابیس محلی رمزنگاری‌شده + صفحهٔ جستجو + فرم ثبت تخلف
 import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite_sqlcipher/sqflite.dart';
 import 'package:uuid/uuid.dart';
+
 import 'excel_service.dart';
+
 /// ۶ مورد چک‌باکس: عنوان‌ها را با موارد واقعی عوض کنید
 const kViolationItems = [
   'لباس کوتاه یا چسبان',
@@ -18,6 +19,7 @@ const kViolationItems = [
   'دمپایی یا صندل',
   'آرایش یا اکسسوری نامتعارف',
 ];
+
 /// یکسان‌سازی متن برای جست‌وجو (حروف عربی → فارسی، ارقام → لاتین)
 String searchNorm(String s) {
   var t = s
@@ -32,6 +34,7 @@ String searchNorm(String s) {
   }
   return t.replaceAll(RegExp(r'\s+'), ' ').trim();
 }
+
 Map<String, String> _decodeExtras(Object? raw) {
   if (raw is! String || raw.isEmpty) return const {};
   try {
@@ -42,10 +45,19 @@ Map<String, String> _decodeExtras(Object? raw) {
   } catch (_) {}
   return const {};
 }
+
+/// نتیجهٔ جست‌وجو: دانشجو + تعداد تخلف‌های ثبت‌شده‌اش
+class StudentHit {
+  final Student student;
+  final int violations;
+  const StudentHit(this.student, this.violations);
+}
+
 /// ───────── دیتابیس محلی (رمزنگاری‌شده) ─────────
 class LocalDb {
   static Database? _db;
   static const _version = 3;
+
   static Future<Database> open(String key) async {
     if (_db != null) return _db!;
     final path = p.join(await getDatabasesPath(), 'dress.db');
@@ -97,7 +109,9 @@ class LocalDb {
     );
     return _db!;
   }
+
   static Database get _d => _db!;
+
   /// ذخیره/به‌روزرسانی دانشجوها (سابقهٔ تخلف دست نمی‌خورد)
   /// در بسته‌های ۴۰۰ تایی نوشته می‌شود تا با ۳۰ هزار دانشجو هم روان بماند
   static Future<void> upsertStudents(
@@ -131,6 +145,7 @@ class LocalDb {
       onProgress?.call(end, list.length);
     }
   }
+
   /// ذخیرهٔ ترتیب ستون‌های فایل ورودی (تا خروجی هم‌شکل همان فایل باشد)
   static Future<void> saveColumns(List<ImportCol> cols) async {
     await _d.insert(
@@ -139,6 +154,7 @@ class LocalDb {
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
+
   /// ستون‌های ذخیره‌شده؛ اگر نبود، فهرست خالی (و خروجی با ستون‌های پیش‌فرض ساخته می‌شود)
   static Future<List<ImportCol>> loadColumns() async {
     final rows = await _d.query('meta', where: 'k=?', whereArgs: ['columns']);
@@ -150,6 +166,7 @@ class LocalDb {
       return const [];
     }
   }
+
   static Student _student(Map<String, Object?> r) => Student(
         studentNo: '${r['student_no'] ?? ''}',
         nationalId: '${r['national_id'] ?? ''}',
@@ -159,24 +176,33 @@ class LocalDb {
         sourceRow: (r['source_row'] as int?) ?? 0,
         extra: _decodeExtras(r['extras']),
       );
+
   /// جست‌وجو: هر کلمه باید در کد دانشجویی، کد ملی یا نام وجود داشته باشد
-  static Future<List<Student>> search(String q) async {
+  /// همراه با تعداد تخلف‌های ثبت‌شدهٔ هر دانشجو (یک کوئری، بدون کندی)
+  static Future<List<StudentHit>> search(String q) async {
     final tokens = searchNorm(q).split(' ').where((t) => t.isNotEmpty).toList();
     if (tokens.isEmpty) return [];
-    final rows = await _d.query(
-      'students',
-      where: tokens.map((_) => 'search_text LIKE ?').join(' AND '),
-      whereArgs: tokens.map((t) => '%$t%').toList(),
-      orderBy: 'last_name, first_name',
-      limit: 50,
-    );
-    return rows.map(_student).toList();
+    final where =
+        tokens.map((_) => 's.search_text LIKE ?').join(' AND ');
+    final rows = await _d.rawQuery('''
+      SELECT s.*,
+             (SELECT COUNT(*) FROM violations v
+               WHERE v.student_key = s.key) AS vcount
+      FROM students s
+      WHERE $where
+      ORDER BY s.last_name, s.first_name
+      LIMIT 50''', tokens.map((t) => '%$t%').toList());
+    return rows
+        .map((r) => StudentHit(_student(r), (r['vcount'] as int?) ?? 0))
+        .toList();
   }
+
   static Future<int> violationCount(String studentKey) async =>
       Sqflite.firstIntValue(await _d.rawQuery(
           'SELECT COUNT(*) FROM violations WHERE student_key=?',
           [studentKey])) ??
       0;
+
   static Future<void> addViolation(Student s, DateTime when, List<String> items,
       String note, String by) async {
     await _d.insert('violations', {
@@ -189,6 +215,7 @@ class LocalDb {
       'synced': 0,
     });
   }
+
   /// برای خروجی اکسل (هر تخلف یک ردیف)
   static Future<List<ViolationRow>> allViolations() async {
     final rows = await _d.rawQuery('''
@@ -207,17 +234,21 @@ class LocalDb {
       );
     }).toList();
   }
+
   static Future<int> studentCount() async =>
       Sqflite.firstIntValue(
           await _d.rawQuery('SELECT COUNT(*) FROM students')) ??
       0;
+
   static Future<int> violationTotal() async =>
       Sqflite.firstIntValue(
           await _d.rawQuery('SELECT COUNT(*) FROM violations')) ??
       0;
+
   /// پشتیبان‌گیری دستی
   static Future<List<Map<String, Object?>>> rawViolations() =>
       _d.query('violations');
+
   /// ادغام تخلف‌های گوشی دیگر؛ شناسهٔ (UUID) تکراری نادیده گرفته می‌شود
   static Future<int> importViolations(List<dynamic> rows) async {
     final have = (await _d.query('violations', columns: ['id']))
@@ -243,11 +274,14 @@ class LocalDb {
     await b.commit(noResult: true);
     return added;
   }
+
   static Future<List<Map<String, Object?>>> unsynced() =>
       _d.query('violations', where: 'synced=0');
+
   static Future<void> markSynced(String id) =>
       _d.update('violations', {'synced': 1}, where: 'id=?', whereArgs: [id]);
 }
+
 /// ───────── اجزای مشترک ظاهری ─────────
 class SectionCard extends StatelessWidget {
   final Widget child;
@@ -257,6 +291,7 @@ class SectionCard extends StatelessWidget {
     required this.child,
     this.padding = const EdgeInsets.all(16),
   });
+
   @override
   Widget build(BuildContext context) => Card(
         elevation: 0,
@@ -266,23 +301,28 @@ class SectionCard extends StatelessWidget {
         child: Padding(padding: padding, child: child),
       );
 }
+
 /// ───────── صفحهٔ جستجو ─────────
 class SearchScreen extends StatefulWidget {
   final String currentUser;
   const SearchScreen({super.key, required this.currentUser});
+
   @override
   State<SearchScreen> createState() => _SearchScreenState();
 }
+
 class _SearchScreenState extends State<SearchScreen> {
   final _ctrl = TextEditingController();
-  List<Student> _results = [];
+  List<StudentHit> _results = [];
   bool _searched = false;
   bool _busy = false;
+
   @override
   void dispose() {
     _ctrl.dispose();
     super.dispose();
   }
+
   Future<void> _run(String q) async {
     final r = await LocalDb.search(q);
     if (!mounted) return;
@@ -291,6 +331,7 @@ class _SearchScreenState extends State<SearchScreen> {
       _searched = q.trim().isNotEmpty;
     });
   }
+
   Future<void> _export() async {
     if (_busy) return;
     setState(() => _busy = true);
@@ -309,10 +350,12 @@ class _SearchScreenState extends State<SearchScreen> {
       if (mounted) setState(() => _busy = false);
     }
   }
+
   void _snack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -365,10 +408,13 @@ class _SearchScreenState extends State<SearchScreen> {
                     itemCount: _results.length,
                     separatorBuilder: (_, __) => const SizedBox(height: 10),
                     itemBuilder: (_, i) {
-                      final s = _results[i];
+                      final hit = _results[i];
+                      final s = hit.student;
+                      final hasHistory = hit.violations > 0;
                       return SectionCard(
                         padding: EdgeInsets.zero,
                         child: ListTile(
+                          isThreeLine: true,
                           contentPadding:
                               const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                           leading: CircleAvatar(
@@ -378,7 +424,40 @@ class _SearchScreenState extends State<SearchScreen> {
                           ),
                           title: Text(s.fullName,
                               style: const TextStyle(fontWeight: FontWeight.w600)),
-                          subtitle: Text('${s.studentNo}  •  ${s.major}'),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const SizedBox(height: 2),
+                              Text('${s.studentNo}  •  ${s.major}'),
+                              const SizedBox(height: 6),
+                              Row(
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 8, vertical: 2),
+                                    decoration: BoxDecoration(
+                                      color: hasHistory
+                                          ? scheme.errorContainer
+                                          : scheme.surfaceContainerHighest,
+                                      borderRadius: BorderRadius.circular(20),
+                                    ),
+                                    child: Text(
+                                      hasHistory
+                                          ? '${hit.violations} تخلف ثبت‌شده'
+                                          : 'بدون سابقه',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                        color: hasHistory
+                                            ? scheme.onErrorContainer
+                                            : scheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
                           trailing: const Icon(Icons.chevron_left),
                           onTap: () async {
                             await Navigator.push(
@@ -399,6 +478,7 @@ class _SearchScreenState extends State<SearchScreen> {
       ),
     );
   }
+
   Widget _empty(ColorScheme scheme) => Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -413,21 +493,25 @@ class _SearchScreenState extends State<SearchScreen> {
         ),
       );
 }
+
 /// ───────── فرم ثبت تخلف ─────────
 class ViolationFormScreen extends StatefulWidget {
   final Student student;
   final String user;
   const ViolationFormScreen(
       {super.key, required this.student, required this.user});
+
   @override
   State<ViolationFormScreen> createState() => _ViolationFormScreenState();
 }
+
 class _ViolationFormScreenState extends State<ViolationFormScreen> {
   final _checked = <String>{};
   final _note = TextEditingController();
   DateTime _when = DateTime.now();
   int _previous = 0;
   bool _saving = false;
+
   @override
   void initState() {
     super.initState();
@@ -435,11 +519,13 @@ class _ViolationFormScreenState extends State<ViolationFormScreen> {
       if (mounted) setState(() => _previous = c);
     });
   }
+
   @override
   void dispose() {
     _note.dispose();
     super.dispose();
   }
+
   Future<void> _pickWhen() async {
     final d = await showDatePicker(
       context: context,
@@ -454,6 +540,7 @@ class _ViolationFormScreenState extends State<ViolationFormScreen> {
     setState(() =>
         _when = DateTime(d.year, d.month, d.day, t.hour, t.minute));
   }
+
   Future<void> _save() async {
     if (_saving) return;
     setState(() => _saving = true);
@@ -471,6 +558,7 @@ class _ViolationFormScreenState extends State<ViolationFormScreen> {
           .showSnackBar(SnackBar(content: Text('خطا: $e')));
     }
   }
+
   @override
   Widget build(BuildContext context) {
     final s = widget.student;
