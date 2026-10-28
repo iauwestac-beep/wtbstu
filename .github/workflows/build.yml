@@ -1,583 +1,166 @@
-// lib/main.dart
-//
-// نسخهٔ بدون سرور — «ثبت تخلف پوشش»
-// ساختار: main.dart + excel_service.dart + violation_module.dart
-import 'dart:convert';
-import 'dart:io';
-import 'dart:math';
+# مسیر در مخزن: .github/workflows/build.yml
+# مخزن فقط پوشه lib (سه فایل) + همین فایل را لازم دارد؛
+# پروژه اندروید داخل خود GitHub ساخته می‌شود.
+name: Build APK
 
-import 'package:file_picker/file_picker.dart';
-import 'package:flutter/material.dart';
-import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:shamsi_date/shamsi_date.dart';
-import 'package:share_plus/share_plus.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+on:
+  workflow_dispatch:        # دکمه Run workflow
+  push:
+    branches: [main]
 
-import 'excel_service.dart';
-import 'violation_module.dart';
+# وقتی چند فایل را پشت سر هم آپلود می‌کنید، GitHub برای هر فایل یک کامیت
+# جدا می‌سازد و هر کامیت یک بیلد راه می‌اندازد؛ این تنظیم بیلدهای قبلی را
+# لغو می‌کند تا فقط آخرین وضعیت مخزن ساخته شود (و اجرای نیمه‌کاره شکست نخورد).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
-/// با هر تغییر، این را یکی بالا ببرید تا از ظاهر برنامه معلوم باشد
-/// کدام نسخه نصب شده است.
-const String kAppVersion = 'نسخه ۷';
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # برای انتشار APK در Releases لازم است (توکن پیش‌فرض فقط read است)
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  final prefs = await SharedPreferences.getInstance();
-  const sec = FlutterSecureStorage();
-  var key = await sec.read(key: 'db_key');
-  if (key == null) {
-    final r = Random.secure();
-    key = base64Url.encode(List.generate(32, (_) => r.nextInt(256)));
-    await sec.write(key: 'db_key', value: key);
-  }
-  await LocalDb.open(key);
-  runApp(StandaloneApp(prefs: prefs));
-}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-class StandaloneApp extends StatelessWidget {
-  final SharedPreferences prefs;
-  const StandaloneApp({super.key, required this.prefs});
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
 
-  @override
-  Widget build(BuildContext context) {
-    const seed = Color(0xFF0F766E);
-    return MaterialApp(
-      title: 'ثبت تخلف پوشش',
-      debugShowCheckedModeBanner: false,
-      locale: const Locale('fa'),
-      supportedLocales: const [Locale('fa')],
-      localizationsDelegates: const [
-        GlobalMaterialLocalizations.delegate,
-        GlobalWidgetsLocalizations.delegate,
-        GlobalCupertinoLocalizations.delegate,
-      ],
-      builder: (c, child) =>
-          Directionality(textDirection: TextDirection.rtl, child: child!),
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: seed,
-          brightness: Brightness.light,
-        ),
-        scaffoldBackgroundColor: const Color(0xFFF6F7F9),
-        snackBarTheme: const SnackBarThemeData(
-          behavior: SnackBarBehavior.floating,
-        ),
-      ),
-      home: StandaloneHome(prefs: prefs),
-    );
-  }
-}
+      # پوشهٔ کد می‌تواند lib یا .lib باشد (اگر هنگام ساخت پوشه اشتباهی نقطه
+      # اول نام اضافه شود، پوشه مخفی می‌شود). هر دو پشتیبانی می‌شوند.
+      - name: Create Android project and copy code
+        run: |
+          flutter create --platforms android --org ir.dresscode --project-name dress_app app_tmp
+          rm -rf app_tmp/lib app_tmp/test
+          mkdir -p app_tmp/lib
+          copied=0
+          for d in lib .lib; do
+            if ls "$d"/*.dart >/dev/null 2>&1; then
+              cp "$d"/*.dart app_tmp/lib/ && copied=1
+              echo "کد از پوشهٔ $d کپی شد"
+            fi
+          done
+          if [ "$copied" -eq 0 ]; then
+            echo "پوشهٔ lib/.lib پیدا نشد؛ استفاده از فایل‌های ریشهٔ مخزن"
+            cp *.dart app_tmp/lib/ 2>/dev/null || true
+          fi
+          if [ ! -f app_tmp/lib/main.dart ] && [ -f app_tmp/lib/main_standalone.dart ]; then
+            mv app_tmp/lib/main_standalone.dart app_tmp/lib/main.dart
+          fi
+          ls app_tmp/lib
+          [ -f app_tmp/lib/main.dart ] \
+            || { echo '::error::main.dart پیدا نشد؛ فایل‌ها را داخل پوشهٔ lib بگذارید'; exit 1; }
 
-class StandaloneHome extends StatefulWidget {
-  final SharedPreferences prefs;
-  const StandaloneHome({super.key, required this.prefs});
+      # اگر موقع کپی/پیست، برچسب زبان بلوک کد (```dart یا dart) یا خط خالی
+      # اول/آخر فایل جا افتاده باشد، Dart آن را کد می‌بیند و بیلد می‌شکند.
+      # این استپ آن خط‌های اضافی را حذف می‌کند.
+      - name: Normalize dart sources
+        run: |
+          for f in app_tmp/lib/*.dart; do
+            first=$(head -1 "$f")
+            case "$first" in
+              dart|'```dart'|'```') sed -i '1d' "$f" ;;
+            esac
+            last=$(tail -1 "$f")
+            case "$last" in
+              '```'|'```dart') sed -i '$d' "$f" ;;
+            esac
+            while [ -s "$f" ] && [ -z "$(head -1 "$f" | tr -d '[:space:]')" ]; do
+              sed -i '1d' "$f"
+            done
+            echo "--- $(basename "$f") | خط اول: $(head -1 "$f")"
+          done
+          [ -n "$(head -1 app_tmp/lib/main.dart)" ] \
+            || { echo '::error::main.dart خالی است'; exit 1; }
 
-  @override
-  State<StandaloneHome> createState() => _StandaloneHomeState();
-}
+      # ── تغییر اصلی ──
+      # file_picker 8.x مقدار compileSdk را در ماژول اندرویدش روی 34 هاردکد کرده بود،
+      # ولی flutter_plugin_android_lifecycle (که خودِ همین پلاگین به آن وابسته است)
+      # با SDK 36 ساخته شده و در AAR خودش «compileSdk >= 36» را الزام می‌کند.
+      # نتیجه: شکست در task :file_picker:checkReleaseAarMetadata.
+      # از نسخه 10.3.3 به بعد، file_picker مقدار compileSdk را از
+      # flutter.compileSdkVersion می‌خواند و مشکل رفع شده است.
+      #
+      # عمداً روی شاخه 10.x قفل شده‌ایم چون کد فعلی از
+      # FilePicker.platform.pickFiles() و FilePickerResult استفاده می‌کند:
+      #   • 11.0.0 → متدها static شدند (FilePicker.pickFiles)
+      #   • 12.0.0 → کلاس FilePickerResult حذف شد و pickFiles لیست برمی‌گرداند
+      # پس ارتقا به 13.x یعنی تغییر کد Dart؛ با 10.3.x کد دست‌نخورده می‌ماند.
+      #
+      # توجه: 10.3.11 توسط نگه‌دارنده retract شده و پاب آن را resolve نمی‌کند
+      # (خطای «doesn't match any versions»). پس کف را 10.3.7 می‌گذاریم تا پاب
+      # خودش بالاترین نسخه معتبر 10.x یعنی 10.3.10 را انتخاب کند.
+      - name: Add packages
+        working-directory: app_tmp
+        run: |
+          flutter pub add excel:^4.0.6 path_provider:^2.1.4 share_plus:^10.0.0 \
+            shamsi_date:^1.1.1 sqflite_sqlcipher:^3.1.0 path:^1.9.0 uuid:^4.5.0 \
+            flutter_secure_storage:^9.2.2 shared_preferences:^2.3.2 file_picker:^10.3.7 \
+            archive:^3.6.1
+          flutter pub add flutter_localizations --sdk=flutter
+          # ثبت نسخه واقعی در لاگ، برای عیب‌یابی دفعات بعد
+          flutter pub deps --style=compact | grep -w file_picker || true
 
-class _StandaloneHomeState extends State<StandaloneHome> {
-  int _students = 0;
-  int _violations = 0;
-  String _msg = '';
-  bool _busy = false;
+      # sed با || true اگر الگو را پیدا نکند بی‌صدا رد می‌شود و minSdk روی
+      # مقدار پیش‌فرض Flutter می‌ماند (بعداً با sqflite_sqlcipher دردسر می‌شود).
+      # پس اینجا نتیجه بررسی و در صورت شکست، جاب متوقف می‌شود.
+      - name: Set minSdk 24
+        working-directory: app_tmp
+        run: |
+          if [ -f android/app/build.gradle.kts ]; then
+            f=android/app/build.gradle.kts
+            sed -i -E 's/minSdk = (flutter\.minSdkVersion|[0-9]+)/minSdk = 24/' "$f"
+          else
+            f=android/app/build.gradle
+            sed -i -E 's/minSdkVersion (flutter\.minSdkVersion|[0-9]+)/minSdkVersion 24/' "$f"
+          fi
+          grep -qE 'minSdk(Version)?[ =]+24' "$f" \
+            || { echo "::error::minSdk patch did not apply to $f"; exit 1; }
 
-  String get _name => widget.prefs.getString('recorder') ?? '';
+      - name: Set app label
+        working-directory: app_tmp
+        run: |
+          sed -i 's/android:label="[^"]*"/android:label="ثبت تخلف پوشش"/' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:label="ثبت تخلف پوشش"' android/app/src/main/AndroidManifest.xml \
+            || { echo '::error::label patch did not apply'; exit 1; }
 
-  @override
-  void initState() {
-    super.initState();
-    _refresh();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_name.isEmpty) _askName();
-    });
-  }
+      # فایل ۳۰ هزار ردیفی چند صد مگابایت حافظه می‌خواهد؛ با سقف پیش‌فرض،
+      # اندروید اپ را می‌بندد. این خط سقف حافظهٔ اپ را بالا می‌برد.
+      - name: Enable large heap
+        working-directory: app_tmp
+        run: |
+          sed -i 's/<application/<application android:largeHeap="true"/' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:largeHeap="true"' android/app/src/main/AndroidManifest.xml \
+            || { echo '::error::largeHeap patch did not apply'; exit 1; }
 
-  Future<void> _refresh() async {
-    final s = await LocalDb.studentCount();
-    final v = await LocalDb.violationTotal();
-    if (!mounted) return;
-    setState(() {
-      _students = s;
-      _violations = v;
-    });
-  }
+      # split-per-abi: به‌جای یک APK ۷۰ مگابایتی (هر سه معماری)، سه APK سبک‌تر
+      # می‌سازد. روی گوشی‌های امروزی فقط app-arm64-v8a-release.apk لازم است.
+      - name: Build release APK
+        working-directory: app_tmp
+        run: flutter build apk --release --split-per-abi
 
-  Future<void> _askName() async {
-    final c = TextEditingController(text: _name);
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: _name.isNotEmpty,
-      builder: (_) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('نام ثبت‌کننده'),
-        content: TextField(
-          controller: c,
-          autofocus: true,
-          decoration: const InputDecoration(
-            hintText: 'نام و نام خانوادگی',
-            border: OutlineInputBorder(),
-          ),
-        ),
-        actions: [
-          FilledButton(
-            onPressed: () {
-              final v = c.text.trim();
-              if (v.isEmpty) return;
-              widget.prefs.setString('recorder', v);
-              Navigator.pop(context);
-            },
-            child: const Text('ذخیره'),
-          ),
-        ],
-      ),
-    );
-    if (mounted) setState(() {});
-  }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dress-app-apk
+          path: app_tmp/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
 
-  void _snack(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  Future<void> _run(Future<void> Function() job) async {
-    if (_busy) return;
-    setState(() {
-      _busy = true;
-      _msg = 'در حال انجام...';
-    });
-    try {
-      await job();
-    } catch (e) {
-      setState(() => _msg = 'خطا: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-      _refresh();
-    }
-  }
-
-  /// آپلود اکسل دانشجوها (سابقهٔ تخلف‌ها حفظ می‌شود)
-  Future<void> _importExcel() async {
-    final pick = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['xlsx', 'csv'],
-    );
-    if (pick == null) return;
-    final path = pick.files.single.path;
-    if (path == null) {
-      _snack('خواندن فایل ممکن نشد');
-      return;
-    }
-    await _run(() async {
-      final svc = ExcelService();
-      setState(() =>
-          _msg = 'در حال خواندن فایل... (فایل‌های بزرگ چند دقیقه طول می‌کشند)');
-      // دانشجوها ۵۰۰تایی مستقیم در دیتابیس نوشته می‌شوند؛ برای همین با
-      // ۳۰ هزار ردیف هم همهٔ رکوردها یک‌جا در حافظه جمع نمی‌شوند.
-      final res = await svc.importStudents(
-        path,
-        onProgress: (done, total) {
-          if (!mounted) return;
-          setState(() => _msg = total > 0
-              ? 'در حال خواندن و ذخیره: $done از $total'
-              : 'در حال خواندن و ذخیره: $done ردیف');
-        },
-        onChunk: (chunk) => LocalDb.upsertStudents(chunk),
-      );
-      if (!mounted) return;
-      // ترتیب ستون‌های همین فایل ذخیره می‌شود تا خروجی هم‌شکل فایل ورودی باشد
-      await LocalDb.saveColumns(res.columns);
-      setState(() => _msg = 'کل ردیف‌ها: ${res.totalRows}\n'
-          'دانشجوی وارد‌شده: ${res.importedCount}\n'
-          'ردیف تکراری (جایگزین شد): ${res.duplicateRows}');
-      if (res.reportFile != null) await svc.share(res.reportFile!);
-    });
-  }
-
-  Future<void> _exportExcel() => _run(() async {
-        final rows = await LocalDb.allViolations();
-        if (rows.isEmpty) {
-          setState(() => _msg = 'هنوز تخلفی ثبت نشده است');
-          return;
-        }
-        final svc = ExcelService();
-        final cols = await LocalDb.loadColumns();
-        await svc.share(await svc.exportViolations(rows, columns: cols));
-        setState(() => _msg = 'خروجی اکسل آماده شد (${rows.length} ردیف)');
-      });
-
-  /// پشتیبان JSON برای جمع‌کردن داده چند گوشی
-  Future<void> _exportBackup() => _run(() async {
-        final data = jsonEncode(
-            {'v': 1, 'violations': await LocalDb.rawViolations()});
-        final dir = await getApplicationDocumentsDirectory();
-        final j = Jalali.now();
-        final stamp = '${j.year}'
-            '${j.month.toString().padLeft(2, '0')}'
-            '${j.day.toString().padLeft(2, '0')}';
-        final f = File('${dir.path}/پشتیبان_تخلف_$stamp.json');
-        await f.writeAsString(data);
-        await Share.shareXFiles([XFile(f.path)]);
-        setState(() => _msg = 'فایل پشتیبان ساخته شد');
-      });
-
-  Future<void> _importBackup() async {
-    final pick = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['json'],
-    );
-    if (pick == null) return;
-    final path = pick.files.single.path;
-    if (path == null) return;
-    await _run(() async {
-      final m = jsonDecode(await File(path).readAsString()) as Map;
-      final added = await LocalDb.importViolations(m['violations'] as List);
-      setState(() => _msg = '$added تخلف جدید اضافه شد '
-          '(موارد تکراری نادیده گرفته شدند)');
-    });
-  }
-
-  Future<void> _openSearch() async {
-    if (_students == 0) {
-      _snack('ابتدا فایل اکسل دانشجویان را وارد کنید');
-      return;
-    }
-    if (_name.isEmpty) {
-      await _askName();
-      if (_name.isEmpty) return;
-    }
-    await Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => SearchScreen(currentUser: _name)),
-    );
-    _refresh();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      body: ListView(
-        padding: EdgeInsets.zero,
-        children: [
-          _Header(
-            name: _name,
-            students: _students,
-            violations: _violations,
-            onEditName: _askName,
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 20, 16, 32),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                FilledButton.icon(
-                  onPressed: _openSearch,
-                  icon: const Icon(Icons.search),
-                  label: const Text('جستجو و ثبت تخلف'),
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(54),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16)),
-                    textStyle: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.w600),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                Text('فایل‌ها',
-                    style: Theme.of(context).textTheme.titleSmall),
-                const SizedBox(height: 8),
-                _ActionTile(
-                  icon: Icons.upload_file,
-                  title: 'وارد کردن اکسل دانشجویان',
-                  subtitle: 'فایل سامانهٔ دانشگاه (xlsx) — برای فایل‌های بزرگ: CSV',
-                  onTap: _busy ? null : _importExcel,
-                ),
-                const SizedBox(height: 10),
-                _ActionTile(
-                  icon: Icons.file_download_outlined,
-                  title: 'خروجی اکسل تخلفات',
-                  subtitle: 'یک شیت، با ستون‌های دانشجو و تخلف',
-                  onTap: _busy ? null : _exportExcel,
-                ),
-                const SizedBox(height: 20),
-                Text('انتقال داده بین گوشی‌ها',
-                    style: Theme.of(context).textTheme.titleSmall),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _MiniTile(
-                        icon: Icons.save_alt,
-                        label: 'ساخت پشتیبان',
-                        onTap: _busy ? null : _exportBackup,
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: _MiniTile(
-                        icon: Icons.restore_page,
-                        label: 'دریافت پشتیبان',
-                        onTap: _busy ? null : _importBackup,
-                      ),
-                    ),
-                  ],
-                ),
-                if (_busy) ...[
-                  const SizedBox(height: 20),
-                  const LinearProgressIndicator(minHeight: 3),
-                ],
-                if (_msg.isNotEmpty) ...[
-                  const SizedBox(height: 16),
-                  Container(
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      color: scheme.primaryContainer.withValues(alpha: 0.6),
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                    child: Text(_msg,
-                        style: TextStyle(color: scheme.onPrimaryContainer)),
-                  ),
-                ],
-                if (_students == 0 && !_busy) ...[
-                  const SizedBox(height: 20),
-                  Text(
-                    'برای شروع، فایل اکسل دانشجویان را وارد کنید.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: scheme.onSurfaceVariant),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// هدر رنگی بالای صفحه + آمار
-class _Header extends StatelessWidget {
-  final String name;
-  final int students;
-  final int violations;
-  final VoidCallback onEditName;
-
-  const _Header({
-    required this.name,
-    required this.students,
-    required this.violations,
-    required this.onEditName,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.fromLTRB(20, 24, 20, 22),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topRight,
-          end: Alignment.bottomLeft,
-          colors: [scheme.primary, scheme.primary.withValues(alpha: 0.72)],
-        ),
-        borderRadius:
-            const BorderRadius.vertical(bottom: Radius.circular(28)),
-      ),
-      child: SafeArea(
-        bottom: false,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                CircleAvatar(
-                  radius: 22,
-                  backgroundColor: Colors.white.withValues(alpha: 0.2),
-                  child: const Icon(Icons.verified_user_outlined,
-                      color: Colors.white),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        name.isEmpty ? 'ثبت تخلف پوشش' : 'سلام $name',
-                        style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700),
-                      ),
-                      const SizedBox(height: 2),
-                      Text('سامانهٔ ثبت و گزارش تخلف پوشش • $kAppVersion',
-                          style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.85),
-                              fontSize: 12)),
-                    ],
-                  ),
-                ),
-                IconButton(
-                  tooltip: 'تغییر نام ثبت‌کننده',
-                  onPressed: onEditName,
-                  icon: const Icon(Icons.edit_outlined, color: Colors.white),
-                ),
-              ],
-            ),
-            const SizedBox(height: 20),
-            Row(
-              children: [
-                Expanded(
-                  child: _Stat(
-                      icon: Icons.people_alt_outlined,
-                      value: '$students',
-                      label: 'دانشجو'),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _Stat(
-                      icon: Icons.report_gmailerrorred_outlined,
-                      value: '$violations',
-                      label: 'تخلف ثبت‌شده'),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _Stat extends StatelessWidget {
-  final IconData icon;
-  final String value;
-  final String label;
-  const _Stat({required this.icon, required this.value, required this.label});
-
-  @override
-  Widget build(BuildContext context) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.16),
-          borderRadius: BorderRadius.circular(18),
-        ),
-        child: Row(
-          children: [
-            Icon(icon, color: Colors.white, size: 22),
-            const SizedBox(width: 10),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(value,
-                    style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700)),
-                Text(label,
-                    style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.85),
-                        fontSize: 11)),
-              ],
-            ),
-          ],
-        ),
-      );
-}
-
-class _ActionTile extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final VoidCallback? onTap;
-  const _ActionTile({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-    this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Material(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(18),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(18),
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Row(
-            children: [
-              Container(
-                width: 42,
-                height: 42,
-                decoration: BoxDecoration(
-                  color: scheme.primaryContainer.withValues(alpha: 0.7),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Icon(icon, color: scheme.onPrimaryContainer, size: 22),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(title,
-                        style: const TextStyle(fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 2),
-                    Text(subtitle,
-                        style: TextStyle(
-                            fontSize: 12, color: scheme.onSurfaceVariant)),
-                  ],
-                ),
-              ),
-              Icon(Icons.chevron_left,
-                  color: scheme.onSurfaceVariant.withValues(alpha: 0.6)),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _MiniTile extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final VoidCallback? onTap;
-  const _MiniTile({required this.icon, required this.label, this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Material(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(16),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(16),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
-          child: Row(
-            children: [
-              Icon(icon, size: 20, color: scheme.primary),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(label,
-                    style: const TextStyle(fontSize: 13),
-                    overflow: TextOverflow.ellipsis),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
+      # Artifacts فقط از داخل صفحهٔ Actions و با حساب وارد‌شده قابل دانلودند
+      # (روی موبایل هم دکمه‌اش اغلب دیده نمی‌شود). این استپ همان APKها را به
+      # Releases منتشر می‌کند تا لینک ثابت و مستقیم داشته باشید:
+      #   .../releases/latest/download/app-arm64-v8a-release.apk
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: APK build ${{ github.run_number }}
+          files: app_tmp/build/app/outputs/flutter-apk/*.apk
+          generate_release_notes: false
