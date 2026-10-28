@@ -235,6 +235,26 @@ class LocalDb {
     }).toList();
   }
 
+  /// سوابق تخلف یک دانشجو (تازه‌ترین اول)
+  static Future<List<ViolationRow>> violationsOf(Student s) async {
+    final rows = await _d.query(
+      'violations',
+      where: 'student_key=?',
+      whereArgs: [s.key],
+      orderBy: 'occurred_at DESC',
+    );
+    return rows.map((r) {
+      return ViolationRow(
+        student: s,
+        occurredAt: DateTime.parse('${r['occurred_at']}'),
+        checkedItems: List<String>.from(
+            jsonDecode('${r['items'] ?? '[]'}') as List),
+        note: '${r['note'] ?? ''}',
+        recordedBy: '${r['recorded_by'] ?? ''}',
+      );
+    }).toList();
+  }
+
   static Future<int> studentCount() async =>
       Sqflite.firstIntValue(
           await _d.rawQuery('SELECT COUNT(*) FROM students')) ??
@@ -299,6 +319,224 @@ class SectionCard extends StatelessWidget {
         color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         child: Padding(padding: padding, child: child),
+      );
+}
+
+/// ───────── صفحهٔ سوابق یک دانشجو ─────────
+class StudentDetailScreen extends StatefulWidget {
+  final Student student;
+  final String currentUser;
+  const StudentDetailScreen({
+    super.key,
+    required this.student,
+    required this.currentUser,
+  });
+
+  @override
+  State<StudentDetailScreen> createState() => _StudentDetailScreenState();
+}
+
+class _StudentDetailScreenState extends State<StudentDetailScreen> {
+  List<ViolationRow> _rows = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final rows = await LocalDb.violationsOf(widget.student);
+    if (!mounted) return;
+    setState(() {
+      _rows = rows;
+      _loading = false;
+    });
+  }
+
+  Future<void> _add() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ViolationFormScreen(
+            student: widget.student, user: widget.currentUser),
+      ),
+    );
+    await _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.student;
+    final scheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(s.fullName),
+        actions: [
+          if (!_loading)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Center(
+                child: Text('${_rows.length} تخلف',
+                    style: TextStyle(
+                        fontSize: 12, color: scheme.onSurfaceVariant)),
+              ),
+            ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _add,
+        icon: const Icon(Icons.add),
+        label: const Text('ثبت تخلف'),
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
+              children: [
+                _header(s, scheme),
+                const SizedBox(height: 18),
+                Row(
+                  children: [
+                    Text('سوابق تخلف',
+                        style: Theme.of(context).textTheme.titleSmall),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: _rows.isEmpty
+                            ? scheme.surfaceContainerHighest
+                            : scheme.errorContainer,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Text(
+                        _rows.isEmpty ? 'ندارد' : '${_rows.length}',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: _rows.isEmpty
+                              ? scheme.onSurfaceVariant
+                              : scheme.onErrorContainer,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                if (_rows.isEmpty)
+                  SectionCard(
+                    child: Column(
+                      children: [
+                        Icon(Icons.inbox_outlined,
+                            size: 42,
+                            color:
+                                scheme.onSurfaceVariant.withValues(alpha: 0.5)),
+                        const SizedBox(height: 8),
+                        Text('هنوز تخلفی برای این دانشجو ثبت نشده است',
+                            style: TextStyle(color: scheme.onSurfaceVariant)),
+                      ],
+                    ),
+                  )
+                else
+                  for (final r in _rows) ...[
+                    _card(r, scheme),
+                    const SizedBox(height: 10),
+                  ],
+              ],
+            ),
+    );
+  }
+
+  Widget _header(Student s, ColorScheme scheme) => SectionCard(
+        child: Row(
+          children: [
+            CircleAvatar(
+              radius: 26,
+              backgroundColor: scheme.primaryContainer,
+              foregroundColor: scheme.onPrimaryContainer,
+              child: Text(s.initial),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(s.fullName,
+                      style: const TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 4),
+                  Text('${s.studentNo}  •  ${s.major}',
+                      style: TextStyle(color: scheme.onSurfaceVariant)),
+                  if (s.nationalId.isNotEmpty)
+                    Text('کد ملی: ${s.nationalId}',
+                        style: TextStyle(
+                            fontSize: 12, color: scheme.onSurfaceVariant)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+
+  Widget _card(ViolationRow r, ColorScheme scheme) => SectionCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.event_note, size: 18, color: scheme.primary),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(jalali(r.occurredAt),
+                      style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          color: scheme.primary,
+                          fontSize: 13)),
+                ),
+                if (r.recordedBy.isNotEmpty)
+                  Text(r.recordedBy,
+                      style: TextStyle(
+                          fontSize: 11, color: scheme.onSurfaceVariant)),
+              ],
+            ),
+            if (r.checkedItems.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: r.checkedItems
+                    .map((t) => Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 9, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: scheme.surface,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                                color: scheme.outlineVariant
+                                    .withValues(alpha: 0.7)),
+                          ),
+                          child: Text(t,
+                              style: const TextStyle(fontSize: 11)),
+                        ))
+                    .toList(),
+              ),
+            ],
+            if (r.note.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.notes,
+                      size: 16, color: scheme.onSurfaceVariant),
+                  const SizedBox(width: 6),
+                  Expanded(child: Text(r.note)),
+                ],
+              ),
+            ],
+          ],
+        ),
       );
 }
 
@@ -463,7 +701,7 @@ class _SearchScreenState extends State<SearchScreen> {
                             await Navigator.push(
                               context,
                               MaterialPageRoute(
-                                builder: (_) => ViolationFormScreen(
+                                builder: (_) => StudentDetailScreen(
                                     student: s, user: widget.currentUser),
                               ),
                             );
