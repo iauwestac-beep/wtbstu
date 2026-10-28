@@ -702,7 +702,8 @@ class _SearchScreenState extends State<SearchScreen> {
                               context,
                               MaterialPageRoute(
                                 builder: (_) => StudentDetailScreen(
-                                    student: s, user: widget.currentUser),
+                                    student: s,
+                                    currentUser: widget.currentUser),
                               ),
                             );
                             _run(_ctrl.text);
