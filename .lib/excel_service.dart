@@ -5,6 +5,7 @@
 // ─ خروجی: یک شیت «تخلفات» با همان ستون‌های فایل ورودی + ستون‌های تخلف
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -152,7 +153,11 @@ const List<String> _violationHeaders = [
 ];
 
 class ImportResult {
+  /// فقط در حالت «همه‌چیز در حافظه» پر می‌شود؛ در حالت جریانی خالی است
   final List<Student> toImport;
+
+  /// تعداد دانشجوهای یکتایی که وارد/به‌روزرسانی شدند
+  final int importedCount;
 
   /// فقط وقتی ساخته می‌شود که ردیف تکراری وجود داشته باشد
   final File? reportFile;
@@ -165,6 +170,7 @@ class ImportResult {
 
   const ImportResult({
     required this.toImport,
+    required this.importedCount,
     required this.reportFile,
     required this.totalRows,
     required this.duplicateRows,
@@ -591,85 +597,151 @@ int _colIndex(String letters) {
   return n - 1;
 }
 
+/// ستون‌های یک ردیف سرصفحه (مشترک بین ایزولهٔ پس‌زمینه و کد اصلی)
+List<_Mapped> _mapHeaderCells(List<String> cells) {
+  final list = <_Mapped>[];
+  final used = <String>{};
+  for (var i = 0; i < cells.length; i++) {
+    final raw = cells[i].trim();
+    if (raw.isEmpty) continue;
+    var key = keyForHeader(raw);
+    if (key == null) continue;
+    if (used.contains(key)) {
+      // ستون تکراری در فایل (مثل «نام وضعیت» و «نام وضعیت _1»)
+      final alt = _duplicateKeyOf(key);
+      if (alt == null || used.contains(alt)) continue;
+      key = alt;
+    }
+    used.add(key);
+    list.add(_Mapped(i, _display[key] ?? raw, key));
+  }
+  return list;
+}
+
+String? _duplicateKeyOf(String key) {
+  switch (key) {
+    case F.statusName:
+      return F.statusName2;
+    case F.studyStart:
+      return F.studyStart2;
+    case F.studyEnd:
+      return F.studyEnd2;
+  }
+  return null;
+}
+
+/// ───────── تبدیل xlsx به متن TSV در ایزولهٔ پس‌زمینه ─────────
+///
+/// این تابع هیچ ارتباطی با UI ندارد و در ایزولهٔ جداگانه اجرا می‌شود؛ خروجی‌اش
+/// متن TSV (‏[0]) و تعداد ردیف‌های داده (‏[1]) است.
+List<Object> _xlsxToTsv(String path) {
+  final bytes = File(path).readAsBytesSync();
+  final archive = ZipDecoder().decodeBytes(bytes);
+
+  final ssFile = _findEntry(archive, 'xl/sharedStrings.xml');
+  final shared = ssFile == null
+      ? const <String>[]
+      : _parseSharedStrings(_entryText(ssFile));
+
+  final sheets = _worksheetFiles(archive);
+  if (sheets.isEmpty) throw Exception('شیت اکسل در فایل پیدا نشد');
+
+  var sample = '';
+  for (final sheetFile in sheets) {
+    final xml = _entryText(sheetFile);
+    if (!xml.contains('<row')) continue;
+
+    final rows = _rowsFromSheet(xml, shared).iterator;
+    final head = <List<String>>[];
+    while (head.length < 8 && rows.moveNext()) {
+      head.add(rows.current);
+    }
+    if (head.isEmpty) continue;
+    if (sample.isEmpty) sample = head.first.take(12).join(' | ');
+
+    var headerRow = 0;
+    var best = <_Mapped>[];
+    for (var i = 0; i < head.length; i++) {
+      final cols = _mapHeaderCells(head[i]);
+      if (cols.length > best.length) {
+        best = cols;
+        headerRow = i;
+      }
+    }
+    // شیت باید سرصفحه‌های شناخته‌شده و ستون شماره دانشجویی داشته باشد
+    if (best.length < 2) continue;
+    if (!best.any((c) => c.key == F.studentNo)) continue;
+
+    final total = _lastRowNumber(xml);
+    final count = total > headerRow ? total - headerRow - 1 : 0;
+
+    final buf = StringBuffer();
+    buf.write(_tsvLine(head[headerRow]));
+    for (var i = headerRow + 1; i < head.length; i++) {
+      buf.write(_tsvLine(head[i]));
+    }
+    while (rows.moveNext()) {
+      buf.write(_tsvLine(rows.current));
+    }
+    return <Object>[buf.toString(), count];
+  }
+  throw Exception('سرصفحه‌های فایل شناخته نشد. ردیف اول: $sample');
+}
+
+String _tsvLine(List<String> cells) {
+  final sb = StringBuffer();
+  for (var i = 0; i < cells.length; i++) {
+    if (i > 0) sb.write('\t');
+    var v = cells[i];
+    if (v.contains('\t') || v.contains('\n') || v.contains('\r')) {
+      v = v.replaceAll('\t', ' ').replaceAll('\n', ' ').replaceAll('\r', ' ');
+    }
+    sb.write(v);
+  }
+  sb.write('\n');
+  return sb.toString();
+}
+
 /// ───────── سرویس اکسل ─────────
 class ExcelService {
-  /// ۱) خواندن فایل دانشجویان (xlsx یا csv)، حذف تکراری‌ها، گزارش تکراری‌ها
-  /// [onProgress] برای نمایش پیشرفت در فایل‌های بزرگ (مثل ۳۰ هزار ردیف)
+  /// ۱) خواندن فایل دانشجویان (xlsx یا csv)، تشخیص تکراری‌ها، گزارش تکراری‌ها
+  /// [onProgress] برای نمایش پیشرفت، و [onChunk] برای تحویل ۵۰۰تایی دانشجوها
+  /// به دیتابیس (تا با ۳۰ هزار ردیف، همه در حافظه جمع نشوند).
   Future<ImportResult> importStudents(
     String path, {
     void Function(int done, int total)? onProgress,
+    Future<void> Function(List<Student> chunk)? onChunk,
   }) async {
     final lower = path.toLowerCase();
     if (lower.endsWith('.csv') || lower.endsWith('.txt')) {
-      return _importDelimited(path, onProgress);
+      return _importDelimited(path, onProgress, onChunk);
     }
-    return _importXlsx(path, onProgress);
+    return _importXlsx(path, onProgress, onChunk);
   }
 
-  /// مسیر اکسل: فایل به‌صورت جریانی (بدون ساخت DOM) خوانده می‌شود.
-  /// با این روش ۳۰ هزار ردیف هم چند ده مگابایت حافظه می‌خواهد، نه چند صد.
+  /// مسیر اکسل: باز کردن و پیمایش فایل در یک **ایزولهٔ پس‌زمینه** انجام می‌شود
+  /// تا رشتهٔ اصلی (UI) هرگز قفل نشود و پیام «برنامه پاسخ نمی‌دهد» نیاید.
+  /// ایزوله در پایان، متن TSV و تعداد ردیف‌ها را برمی‌گرداند و خودش از بین می‌رود.
   Future<ImportResult> _importXlsx(
     String path,
     void Function(int done, int total)? onProgress,
+    Future<void> Function(List<Student> chunk)? onChunk,
   ) async {
-    final bytes = await File(path).readAsBytes();
-    final archive = ZipDecoder().decodeBytes(bytes);
+    // کار سنگین (باز کردن زیپ + پیمایش XML) در ایزولهٔ دیگر انجام می‌شود؛
+    // رشتهٔ اصلی فقط منتظر می‌ماند و UI روان می‌ماند.
+    final List<Object> payload =
+        await Isolate.run(() => _xlsxToTsv(path));
 
-    final ssFile = _findEntry(archive, 'xl/sharedStrings.xml');
-    final shared = ssFile == null
-        ? const <String>[]
-        : _parseSharedStrings(_entryText(ssFile));
-
-    final sheets = _worksheetFiles(archive);
-    if (sheets.isEmpty) throw Exception('شیت اکسل در فایل پیدا نشد');
-
-    var firstSample = '';
-    for (final sheetFile in sheets) {
-      final xml = _entryText(sheetFile);
-      if (!xml.contains('<row')) continue;
-
-      final it = _rowsFromSheet(xml, shared).iterator;
-      // سرصفحه در یکی از ۸ ردیف اول جست‌وجو می‌شود
-      final head = <List<String>>[];
-      while (head.length < 8 && it.moveNext()) {
-        head.add(it.current);
-      }
-      if (head.isEmpty) continue;
-      if (firstSample.isEmpty) firstSample = head.first.take(12).join(' | ');
-
-      var headerRow = 0;
-      var best = <_Mapped>[];
-      for (var i = 0; i < head.length; i++) {
-        final cols = _mapHeaders(head[i]);
-        if (cols.length > best.length) {
-          best = cols;
-          headerRow = i;
-        }
-      }
-      // این شیت باید هم سرصفحه‌های شناخته‌شده داشته باشد، هم شماره دانشجویی
-      if (best.length < 2) continue;
-      if (!best.any((c) => c.key == F.studentNo)) continue;
-
-      Iterable<List<String>> dataRows() sync* {
-        for (var i = headerRow + 1; i < head.length; i++) {
-          yield head[i];
-        }
-        while (it.moveNext()) {
-          yield it.current;
-        }
-      }
-
-      final total = _lastRowNumber(xml);
-      final count = total > headerRow ? total - headerRow - 1 : 0;
-      return _assemble(head[headerRow], dataRows(), count, onProgress);
-    }
-    throw Exception('سرصفحه‌های فایل شناخته نشد. ردیف اول: $firstSample');
+    final text = payload[0] as String;
+    final total = payload[1] as int;
+    return _importFromText(text, onProgress, onChunk, total: total);
   }
 
   /// مسیر CSV/TSV: مصرف حافظه بسیار کمتر، مناسب فایل‌های چندهزار ردیفی
   Future<ImportResult> _importDelimited(
     String path,
     void Function(int done, int total)? onProgress,
+    Future<void> Function(List<Student> chunk)? onChunk,
   ) async {
     final bytes = await File(path).readAsBytes();
     String text;
@@ -679,32 +751,65 @@ class ExcelService {
       throw Exception('فایل CSV با UTF-8 ذخیره نشده است. '
           'در اکسل گزینهٔ «CSV UTF-8» را انتخاب کنید.');
     }
-    if (text.startsWith('\uFEFF')) text = text.substring(1);
-    final rows = _parseDelimited(text);
-    if (rows.isEmpty) throw Exception('فایل خالی است');
+    return _importFromText(text, onProgress, onChunk);
+  }
+
+  /// پردازش متن جدول‌بندی‌شده (خروجی ایزولهٔ اکسل یا فایل CSV)
+  Future<ImportResult> _importFromText(
+    String text,
+    void Function(int done, int total)? onProgress,
+    Future<void> Function(List<Student> chunk)? onChunk, {
+    int total = 0,
+  }) async {
+    var body = text;
+    if (body.startsWith('\uFEFF')) body = body.substring(1);
+
+    final it = _parseDelimited(body).iterator;
+    final head = <List<String>>[];
+    while (head.length < 8 && it.moveNext()) {
+      head.add(it.current);
+    }
+    if (head.isEmpty) throw Exception('فایل خالی است');
 
     var headerRow = 0;
     var best = <_Mapped>[];
-    final limit = rows.length < 8 ? rows.length : 8;
-    for (var i = 0; i < limit; i++) {
-      final cols = _mapHeaders(rows[i]);
+    for (var i = 0; i < head.length; i++) {
+      final cols = _mapHeaderCells(head[i]);
       if (cols.length > best.length) {
         best = cols;
         headerRow = i;
       }
     }
-    return _assemble(rows[headerRow], rows.skip(headerRow + 1),
-        rows.length - headerRow - 1, onProgress);
+    if (best.length < 2) {
+      throw Exception('سرصفحه‌های فایل شناخته نشد. '
+          'ردیف اول: ${head.first.take(12).join(' | ')}');
+    }
+
+    Iterable<List<String>> dataRows() sync* {
+      for (var i = headerRow + 1; i < head.length; i++) {
+        yield head[i];
+      }
+      while (it.moveNext()) {
+        yield it.current;
+      }
+    }
+
+    final count = total > headerRow ? total - headerRow - 1 : 0;
+    return _assemble(head[headerRow], dataRows(), count, onProgress, onChunk);
   }
 
-  /// منطق مشترک هر دو مسیر: ساخت دانشجوها، حذف تکراری‌ها، گزارش تکراری‌ها
+  /// منطق مشترک هر دو مسیر: ساخت دانشجوها، تشخیص تکراری‌ها، گزارش
+  ///
+  /// اگر [onChunk] داده شود، دانشجوها همان‌جا (۵۰۰تایی) تحویل داده می‌شوند و
+  /// هیچ‌وقت همه‌شان در حافظه جمع نمی‌شوند — این حالت برای فایل‌های بزرگ است.
   Future<ImportResult> _assemble(
     List<String> headerCells,
     Iterable<List<String>> dataRows,
     int total,
     void Function(int done, int total)? onProgress,
+    Future<void> Function(List<Student> chunk)? onChunk,
   ) async {
-    final cols = _mapHeaders(headerCells);
+    final cols = _mapHeaderCells(headerCells);
     if (cols.length < 2) {
       throw Exception('سرصفحه‌های فایل شناخته نشد. '
           'ردیف اول: ${headerCells.take(12).join(' | ')}');
@@ -718,10 +823,15 @@ class ExcelService {
           'سرصفحه‌ها: ${headerCells.take(12).join(' | ')}');
     }
 
+    // مسیر حافظه‌ای (فایل کوچک) دانشجوها را نگه می‌دارد؛ مسیر جریانی فقط
+    // کلیدها را برای تشخیص تکراری و یک بستهٔ ۵۰۰تایی.
     final unique = <String, Student>{};
+    final keys = <String>{};
+    final buffer = <Student>[];
     final dupRows = <List<String>>[];
     var scanned = 0;
     var withNo = 0;
+
     for (final cells in dataRows) {
       scanned++;
       final no = fixDigits(_cellAt(cells, colOf[F.studentNo]));
@@ -751,8 +861,8 @@ class ExcelService {
       // تکراری: همان شماره دانشجویی با همان رشته → ردیف جدید جای ردیف قبلی
       // می‌نشیند (آخرین ردیف برنده است). سابقهٔ تخلف دست نمی‌خورد چون در جدول
       // جداگانه و با همان کلید «شماره|رشته» ذخیره شده است.
-      if (unique.containsKey(s.key)) {
-        unique[s.key] = s;
+      final isDup = onChunk == null ? unique.containsKey(s.key) : keys.contains(s.key);
+      if (isDup) {
         dupRows.add([
           s.studentNo,
           s.nationalId,
@@ -762,18 +872,32 @@ class ExcelService {
           '${s.sourceRow}',
           'تکراری — با ردیف جدید جایگزین شد',
         ]);
-      } else {
+      }
+
+      if (onChunk == null) {
         unique[s.key] = s;
+      } else {
+        keys.add(s.key);
+        buffer.add(s);
+        if (buffer.length >= 500) {
+          await onChunk(List<Student>.of(buffer));
+          buffer.clear();
+        }
       }
 
       if (onProgress != null && scanned % 500 == 0) onProgress(scanned, total);
     }
 
-    final imported = unique.values.toList();
+    if (onChunk != null && buffer.isNotEmpty) {
+      await onChunk(List<Student>.of(buffer));
+      buffer.clear();
+    }
+
     // گزارش فقط برای ردیف‌های تکراری ساخته می‌شود (نه برای همهٔ ۳۰ هزار ردیف)
     final report = dupRows.isEmpty ? null : await _writeReport(dupRows);
     return ImportResult(
-      toImport: imported,
+      toImport: unique.values.toList(),
+      importedCount: onChunk == null ? unique.length : keys.length,
       reportFile: report,
       totalRows: withNo,
       duplicateRows: dupRows.length,
@@ -782,86 +906,54 @@ class ExcelService {
     );
   }
 
-  /// خواندن CSV/TSV؛ جداکننده (کاما، نقطه‌ویرگول یا تب) خودکار تشخیص داده می‌شود
-  List<List<String>> _parseDelimited(String text) {
-    final firstLine = text.split('\n').first;
+  /// خواندن CSV/TSV به‌صورت تنبل (ردیف‌به‌ردیف)؛ جداکننده خودکار تشخیص داده می‌شود
+  Iterable<List<String>> _parseDelimited(String text) sync* {
+    // فقط تا اولین خط جدید جست‌وجو می‌کند (نه split کل متن)
+    final nl = text.indexOf('\n');
+    final firstLine = nl < 0 ? text : text.substring(0, nl);
     final commas = ','.allMatches(firstLine).length;
     final semis = ';'.allMatches(firstLine).length;
     final tabs = '\t'.allMatches(firstLine).length;
     final delim = (tabs >= commas && tabs >= semis)
-        ? '\t'
-        : (semis > commas ? ';' : ',');
+        ? 0x09
+        : (semis > commas ? 0x3B : 0x2C);
 
-    final rows = <List<String>>[];
     var row = <String>[];
     final buf = StringBuffer();
     var inQuotes = false;
     for (var i = 0; i < text.length; i++) {
-      final ch = text[i];
+      final cu = text.codeUnitAt(i);
       if (inQuotes) {
-        if (ch == '"') {
-          if (i + 1 < text.length && text[i + 1] == '"') {
-            buf.write('"');
+        if (cu == 0x22) {
+          if (i + 1 < text.length && text.codeUnitAt(i + 1) == 0x22) {
+            buf.writeCharCode(0x22);
             i++;
           } else {
             inQuotes = false;
           }
         } else {
-          buf.write(ch);
+          buf.writeCharCode(cu);
         }
         continue;
       }
-      if (ch == '"') {
+      if (cu == 0x22) {
         inQuotes = true;
-      } else if (ch == delim) {
+      } else if (cu == delim) {
         row.add(buf.toString().trim());
         buf.clear();
-      } else if (ch == '\n') {
+      } else if (cu == 0x0A) {
         row.add(buf.toString().trim());
         buf.clear();
-        rows.add(row);
+        yield row;
         row = <String>[];
-      } else if (ch != '\r') {
-        buf.write(ch);
+      } else if (cu != 0x0D) {
+        buf.writeCharCode(cu);
       }
     }
     if (buf.isNotEmpty || row.isNotEmpty) {
       row.add(buf.toString().trim());
-      rows.add(row);
+      yield row;
     }
-    return rows;
-  }
-
-  List<_Mapped> _mapHeaders(List<String> cells) {
-    final list = <_Mapped>[];
-    final used = <String>{};
-    for (var i = 0; i < cells.length; i++) {
-      final raw = cells[i].trim();
-      if (raw.isEmpty) continue;
-      var key = keyForHeader(raw);
-      if (key == null) continue;
-      if (used.contains(key)) {
-        // ستون تکراری در فایل (مثل «نام وضعیت» و «نام وضعیت _1»)
-        final alt = _duplicateKeyOf(key);
-        if (alt == null || used.contains(alt)) continue;
-        key = alt;
-      }
-      used.add(key);
-      list.add(_Mapped(i, _display[key] ?? raw, key));
-    }
-    return list;
-  }
-
-  String? _duplicateKeyOf(String key) {
-    switch (key) {
-      case F.statusName:
-        return F.statusName2;
-      case F.studyStart:
-        return F.studyStart2;
-      case F.studyEnd:
-        return F.studyEnd2;
-    }
-    return null;
   }
 
   String _cellAt(List<String> cells, int? index) {
