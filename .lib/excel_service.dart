@@ -1,5 +1,3 @@
-dart
-
 // lib/excel_service.dart
 //
 // ورود/خروجی اکسل برای برنامهٔ «ثبت تخلف پوشش»
@@ -7,6 +5,8 @@ dart
 // ─ خروجی: یک شیت «تخلفات» با همان ستون‌های فایل ورودی + ستون‌های تخلف
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
+import 'package:archive/archive.dart';
 import 'package:excel/excel.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -338,17 +338,6 @@ String? keyForHeader(String header) {
   }
   return null;
 }
-String _text(Data? d) {
-  final v = d?.value;
-  if (v == null) return '';
-  if (v is TextCellValue) return v.value.toString().trim();
-  if (v is IntCellValue) return v.value.toString();
-  if (v is DoubleCellValue) {
-    final x = v.value;
-    return x == x.truncateToDouble() ? x.toInt().toString() : x.toString();
-  }
-  return v.toString().trim();
-}
 String jalali(DateTime when) {
   final l = when.toLocal();
   final j = Jalali.fromDateTime(l);
@@ -385,6 +374,179 @@ class _Mapped {
   final String key;
   const _Mapped(this.index, this.header, this.key);
 }
+/// ───────── خواندن سبک xlsx (جریانی، بدون DOM) ─────────
+final RegExp _reCellRef = RegExp(r'r="([A-Z]+)\d+"');
+final RegExp _reCellType = RegExp(r't="([^"]+)"');
+ArchiveFile? _findEntry(Archive archive, String name) {
+  for (final f in archive.files) {
+    if (f.name == name) return f;
+  }
+  return null;
+}
+/// فایل‌های شیت داخل بستهٔ xlsx (sheet1.xml اول از همه)
+List<ArchiveFile> _worksheetFiles(Archive archive) {
+  final list = <ArchiveFile>[];
+  for (final f in archive.files) {
+    if (f.name.startsWith('xl/worksheets/') && f.name.endsWith('.xml')) {
+      list.add(f);
+    }
+  }
+  list.sort((a, b) => a.name.compareTo(b.name));
+  final first = _findEntry(archive, 'xl/worksheets/sheet1.xml');
+  if (first != null) {
+    list.remove(first);
+    list.insert(0, first);
+  }
+  return list;
+}
+String _entryText(ArchiveFile file) {
+  final content = file.content;
+  final bytes = content is Uint8List
+      ? content
+      : Uint8List.fromList((content as List).cast<int>());
+  // allowMalformed: فایل خراب یا نویسهٔ نامعتبر باعث خطا نشود
+  return utf8.decode(bytes, allowMalformed: true);
+}
+String _xmlUnescape(String s) {
+  if (!s.contains('&')) return s;
+  var out = s;
+  if (out.contains('&#')) {
+    out = out.replaceAllMapped(RegExp(r'&#x([0-9a-fA-F]+);'),
+        (m) => String.fromCharCode(int.parse(m[1]!, radix: 16)));
+    out = out.replaceAllMapped(RegExp(r'&#(\d+);'),
+        (m) => String.fromCharCode(int.parse(m[1]!)));
+  }
+  return out
+      .replaceAll('&lt;', '<')
+      .replaceAll('&gt;', '>')
+      .replaceAll('&quot;', '"')
+      .replaceAll('&apos;', "'")
+      .replaceAll('&amp;', '&');
+}
+/// همهٔ رشته‌های مشترک (xl/sharedStrings.xml) را به لیست تبدیل می‌کند
+List<String> _parseSharedStrings(String xml) {
+  final out = <String>[];
+  var pos = 0;
+  while (true) {
+    var start = xml.indexOf('<si>', pos);
+    final startAttr = xml.indexOf('<si ', pos);
+    if (start < 0 || (startAttr >= 0 && startAttr < start)) start = startAttr;
+    if (start < 0) break;
+    final end = xml.indexOf('</si>', start);
+    if (end < 0) break;
+    final chunk = xml.substring(start, end);
+    final buf = StringBuffer();
+    var j = 0;
+    while (true) {
+      final t1 = chunk.indexOf('<t', j);
+      if (t1 < 0) break;
+      final gt = chunk.indexOf('>', t1);
+      if (gt < 0) break;
+      if (chunk[gt - 1] == '/') {
+        j = gt + 1;
+        continue;
+      }
+      final t2 = chunk.indexOf('</t>', gt);
+      if (t2 < 0) break;
+      buf.write(chunk.substring(gt + 1, t2));
+      j = t2 + 4;
+    }
+    out.add(_xmlUnescape(buf.toString()));
+    pos = end + 5;
+  }
+  return out;
+}
+/// شمارهٔ آخرین ردیف از <dimension ref="A1:Q3000"/>
+int _lastRowNumber(String xml) {
+  final i = xml.indexOf('<dimension ref="');
+  if (i < 0) return 0;
+  final start = i + 16;
+  final end = xml.indexOf('"', start);
+  if (end < 0) return 0;
+  final ref = xml.substring(start, end);
+  final digits = RegExp(r'(\d+)').allMatches(ref).toList();
+  if (digits.isEmpty) return 0;
+  return int.tryParse(digits.last[1]!) ?? 0;
+}
+/// ردیف‌ها یکی‌یکی تولید می‌شوند تا کل جدول در حافظه نماند
+Iterable<List<String>> _rowsFromSheet(String xml, List<String> shared) sync* {
+  var pos = 0;
+  while (true) {
+    final rs = xml.indexOf('<row', pos);
+    if (rs < 0) break;
+    final gt = xml.indexOf('>', rs);
+    if (gt < 0) break;
+    if (xml[gt - 1] == '/') {
+      yield <String>[];
+      pos = gt + 1;
+      continue;
+    }
+    final re = xml.indexOf('</row>', gt);
+    if (re < 0) break;
+    yield _parseRow(xml.substring(gt + 1, re), shared);
+    pos = re + 6;
+  }
+}
+List<String> _parseRow(String rowXml, List<String> shared) {
+  final cells = <String>[];
+  var pos = 0;
+  while (true) {
+    final cs = rowXml.indexOf('<c', pos);
+    if (cs < 0) break;
+    final gt = rowXml.indexOf('>', cs);
+    if (gt < 0) break;
+    final attrs = rowXml.substring(cs + 2, gt);
+    final selfClose = attrs.endsWith('/');
+    final refMatch = _reCellRef.firstMatch(attrs);
+    final col = refMatch == null ? cells.length : _colIndex(refMatch[1]!);
+    var value = '';
+    if (selfClose) {
+      pos = gt + 1;
+    } else {
+      final ce = rowXml.indexOf('</c>', gt);
+      if (ce < 0) break;
+      value = _cellValue(rowXml.substring(gt + 1, ce), attrs, shared);
+      pos = ce + 4;
+    }
+    while (cells.length <= col) {
+      cells.add('');
+    }
+    cells[col] = value;
+  }
+  return cells;
+}
+String _cellValue(String inner, String attrs, List<String> shared) {
+  final type = _reCellType.firstMatch(attrs)?[1];
+  if (type == 'inlineStr') {
+    final tStart = inner.indexOf('<t');
+    if (tStart < 0) return '';
+    final gt = inner.indexOf('>', tStart);
+    if (gt < 0) return '';
+    final te = inner.indexOf('</t>', gt);
+    if (te < 0) return '';
+    return _xmlUnescape(inner.substring(gt + 1, te));
+  }
+  final vStart = inner.indexOf('<v>');
+  if (vStart < 0) return '';
+  final vEnd = inner.indexOf('</v>', vStart);
+  if (vEnd < 0) return '';
+  final raw = inner.substring(vStart + 3, vEnd);
+  if (type == 's') {
+    final idx = int.tryParse(raw.trim());
+    if (idx == null || idx < 0 || idx >= shared.length) return '';
+    return shared[idx];
+  }
+  if (type == 'b') return raw.trim() == '1' ? 'TRUE' : 'FALSE';
+  return _xmlUnescape(raw).trim();
+}
+/// ستون حرفی (A, B, ..., AA) → شمارهٔ صفر-مبنا
+int _colIndex(String letters) {
+  var n = 0;
+  for (var i = 0; i < letters.length; i++) {
+    n = n * 26 + (letters.codeUnitAt(i) - 64);
+  }
+  return n - 1;
+}
 /// ───────── سرویس اکسل ─────────
 class ExcelService {
   /// ۱) خواندن فایل دانشجویان (xlsx یا csv)، حذف تکراری‌ها، گزارش تکراری‌ها
@@ -399,46 +561,57 @@ class ExcelService {
     }
     return _importXlsx(path, onProgress);
   }
-  /// مسیر اکسل: کتابخانهٔ excel کل فایل را یکجا در حافظه می‌خواند، پس برای
-  /// فایل‌های خیلی بزرگ (۳۰ هزار ردیف) ممکن است حافظه کم بیاورد.
-  /// مسیر CSV (تابع بعدی) حافظهٔ بسیار کمتری می‌خواهد.
+  /// مسیر اکسل: فایل به‌صورت جریانی (بدون ساخت DOM) خوانده می‌شود.
+  /// با این روش ۳۰ هزار ردیف هم چند ده مگابایت حافظه می‌خواهد، نه چند صد.
   Future<ImportResult> _importXlsx(
     String path,
     void Function(int done, int total)? onProgress,
   ) async {
-    final excel = Excel.decodeBytes(await File(path).readAsBytes());
-    // بهترین (شیت، ردیف سرصفحه) را پیدا می‌کند؛ تحمل ردیف عنوان بالای جدول
-    Sheet? sheet;
-    var headerRow = 0;
-    var bestCols = <_Mapped>[];
-    for (final candidate in excel.tables.values) {
-      final limit = candidate.rows.length < 8 ? candidate.rows.length : 8;
-      for (var r = 0; r < limit; r++) {
-        final cols = _mapHeaders(candidate.rows[r].map(_text).toList());
-        if (cols.length > bestCols.length) {
-          bestCols = cols;
-          sheet = candidate;
-          headerRow = r;
+    final bytes = await File(path).readAsBytes();
+    final archive = ZipDecoder().decodeBytes(bytes);
+    final ssFile = _findEntry(archive, 'xl/sharedStrings.xml');
+    final shared = ssFile == null
+        ? const <String>[]
+        : _parseSharedStrings(_entryText(ssFile));
+    final sheets = _worksheetFiles(archive);
+    if (sheets.isEmpty) throw Exception('شیت اکسل در فایل پیدا نشد');
+    var firstSample = '';
+    for (final sheetFile in sheets) {
+      final xml = _entryText(sheetFile);
+      if (!xml.contains('<row')) continue;
+      final it = _rowsFromSheet(xml, shared).iterator;
+      // سرصفحه در یکی از ۸ ردیف اول جست‌وجو می‌شود
+      final head = <List<String>>[];
+      while (head.length < 8 && it.moveNext()) {
+        head.add(it.current);
+      }
+      if (head.isEmpty) continue;
+      if (firstSample.isEmpty) firstSample = head.first.take(12).join(' | ');
+      var headerRow = 0;
+      var best = <_Mapped>[];
+      for (var i = 0; i < head.length; i++) {
+        final cols = _mapHeaders(head[i]);
+        if (cols.length > best.length) {
+          best = cols;
+          headerRow = i;
         }
       }
+      // این شیت باید هم سرصفحه‌های شناخته‌شده داشته باشد، هم شماره دانشجویی
+      if (best.length < 2) continue;
+      if (!best.any((c) => c.key == F.studentNo)) continue;
+      Iterable<List<String>> dataRows() sync* {
+        for (var i = headerRow + 1; i < head.length; i++) {
+          yield head[i];
+        }
+        while (it.moveNext()) {
+          yield it.current;
+        }
+      }
+      final total = _lastRowNumber(xml);
+      final count = total > headerRow ? total - headerRow - 1 : 0;
+      return _assemble(head[headerRow], dataRows(), count, onProgress);
     }
-    if (sheet == null || bestCols.length < 2) {
-      // پیام خطا شامل سرصفحه‌های واقعی فایل است تا عیب‌یابی ساده باشد
-      final sample = excel.tables.values
-          .where((s) => s.rows.isNotEmpty)
-          .map((s) => s.rows.first.take(12).map(_text).join(' | '))
-          .join('  ||  ');
-      throw Exception('سرصفحه‌های فایل شناخته نشد. ردیف اول: $sample');
-    }
-    final Sheet sh = sheet;
-    final header = sh.rows[headerRow].map(_text).toList();
-    return _assemble(header, _xlsxRows(sh, headerRow + 1),
-        sh.rows.length - headerRow - 1, onProgress);
-  }
-  Iterable<List<String>> _xlsxRows(Sheet sh, int start) sync* {
-    for (var r = start; r < sh.rows.length; r++) {
-      yield sh.rows[r].map(_text).toList();
-    }
+    throw Exception('سرصفحه‌های فایل شناخته نشد. ردیف اول: $firstSample');
   }
   /// مسیر CSV/TSV: مصرف حافظه بسیار کمتر، مناسب فایل‌های چندهزار ردیفی
   Future<ImportResult> _importDelimited(
