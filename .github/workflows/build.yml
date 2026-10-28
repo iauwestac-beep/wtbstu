@@ -2,16 +2,19 @@
 # مخزن فقط پوشه lib (سه فایل) + همین فایل را لازم دارد؛
 # پروژه اندروید داخل خود GitHub ساخته می‌شود.
 name: Build APK
+
 on:
   workflow_dispatch:        # دکمه Run workflow
   push:
     branches: [main]
+
 # وقتی چند فایل را پشت سر هم آپلود می‌کنید، GitHub برای هر فایل یک کامیت
 # جدا می‌سازد و هر کامیت یک بیلد راه می‌اندازد؛ این تنظیم بیلدهای قبلی را
 # لغو می‌کند تا فقط آخرین وضعیت مخزن ساخته شود (و اجرای نیمه‌کاره شکست نخورد).
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,14 +23,17 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
+
       # پوشهٔ کد می‌تواند lib یا .lib باشد (اگر هنگام ساخت پوشه اشتباهی نقطه
       # اول نام اضافه شود، پوشه مخفی می‌شود). هر دو پشتیبانی می‌شوند.
       - name: Create Android project and copy code
@@ -52,6 +58,29 @@ jobs:
           ls app_tmp/lib
           [ -f app_tmp/lib/main.dart ] \
             || { echo '::error::main.dart پیدا نشد؛ فایل‌ها را داخل پوشهٔ lib بگذارید'; exit 1; }
+
+      # اگر موقع کپی/پیست، برچسب زبان بلوک کد (```dart یا dart) یا خط خالی
+      # اول/آخر فایل جا افتاده باشد، Dart آن را کد می‌بیند و بیلد می‌شکند.
+      # این استپ آن خط‌های اضافی را حذف می‌کند.
+      - name: Normalize dart sources
+        run: |
+          for f in app_tmp/lib/*.dart; do
+            first=$(head -1 "$f")
+            case "$first" in
+              dart|'```dart'|'```') sed -i '1d' "$f" ;;
+            esac
+            last=$(tail -1 "$f")
+            case "$last" in
+              '```'|'```dart') sed -i '$d' "$f" ;;
+            esac
+            while [ -s "$f" ] && [ -z "$(head -1 "$f" | tr -d '[:space:]')" ]; do
+              sed -i '1d' "$f"
+            done
+            echo "--- $(basename "$f") | خط اول: $(head -1 "$f")"
+          done
+          [ -n "$(head -1 app_tmp/lib/main.dart)" ] \
+            || { echo '::error::main.dart خالی است'; exit 1; }
+
       # ── تغییر اصلی ──
       # file_picker 8.x مقدار compileSdk را در ماژول اندرویدش روی 34 هاردکد کرده بود،
       # ولی flutter_plugin_android_lifecycle (که خودِ همین پلاگین به آن وابسته است)
@@ -78,6 +107,7 @@ jobs:
           flutter pub add flutter_localizations --sdk=flutter
           # ثبت نسخه واقعی در لاگ، برای عیب‌یابی دفعات بعد
           flutter pub deps --style=compact | grep -w file_picker || true
+
       # sed با || true اگر الگو را پیدا نکند بی‌صدا رد می‌شود و minSdk روی
       # مقدار پیش‌فرض Flutter می‌ماند (بعداً با sqflite_sqlcipher دردسر می‌شود).
       # پس اینجا نتیجه بررسی و در صورت شکست، جاب متوقف می‌شود.
@@ -93,12 +123,14 @@ jobs:
           fi
           grep -qE 'minSdk(Version)?[ =]+24' "$f" \
             || { echo "::error::minSdk patch did not apply to $f"; exit 1; }
+
       - name: Set app label
         working-directory: app_tmp
         run: |
           sed -i 's/android:label="[^"]*"/android:label="ثبت تخلف پوشش"/' android/app/src/main/AndroidManifest.xml
           grep -q 'android:label="ثبت تخلف پوشش"' android/app/src/main/AndroidManifest.xml \
             || { echo '::error::label patch did not apply'; exit 1; }
+
       # فایل ۳۰ هزار ردیفی چند صد مگابایت حافظه می‌خواهد؛ با سقف پیش‌فرض،
       # اندروید اپ را می‌بندد. این خط سقف حافظهٔ اپ را بالا می‌برد.
       - name: Enable large heap
@@ -107,16 +139,19 @@ jobs:
           sed -i 's/<application/<application android:largeHeap="true"/' android/app/src/main/AndroidManifest.xml
           grep -q 'android:largeHeap="true"' android/app/src/main/AndroidManifest.xml \
             || { echo '::error::largeHeap patch did not apply'; exit 1; }
+
       # split-per-abi: به‌جای یک APK ۷۰ مگابایتی (هر سه معماری)، سه APK سبک‌تر
       # می‌سازد. روی گوشی‌های امروزی فقط app-arm64-v8a-release.apk لازم است.
       - name: Build release APK
         working-directory: app_tmp
         run: flutter build apk --release --split-per-abi
+
       - uses: actions/upload-artifact@v4
         with:
           name: dress-app-apk
           path: app_tmp/build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
+
       # Artifacts فقط از داخل صفحهٔ Actions و با حساب وارد‌شده قابل دانلودند
       # (روی موبایل هم دکمه‌اش اغلب دیده نمی‌شود). این استپ همان APKها را به
       # Releases منتشر می‌کند تا لینک ثابت و مستقیم داشته باشید:
